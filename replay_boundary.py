@@ -1,4 +1,4 @@
-"""Replay boundary frames in the global XY coordinate system."""
+"""Replay boundary frames in global XY and camera XZ coordinates."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ import re
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, Slider
 import numpy as np
+
+from boundary_shape import orient_shape, recognize
 
 
 LOG_PATTERN = re.compile(
@@ -27,6 +29,7 @@ class Frame:
     timestamp: float
     robot_xyz: np.ndarray
     robot_yaw: float
+    camera_xz: np.ndarray
     world_points: np.ndarray
 
 
@@ -59,7 +62,8 @@ def parse_frame(line: str, line_number: int) -> Frame:
     robot_xyz = np.asarray(pose[:3])
     world_points = (camera_points @ rotation(*CAMERA_RPY).T + CAMERA_TRANSLATION)
     world_points = world_points @ rotation(*pose[3:6]).T + robot_xyz
-    return Frame(match.group("clock"), pose[6], robot_xyz, pose[5], world_points)
+    return Frame(match.group("clock"), pose[6], robot_xyz, pose[5],
+                 camera_points[:, (0, 2)], world_points)
 
 
 def load_frames(path: Path) -> list[Frame]:
@@ -71,8 +75,8 @@ def load_frames(path: Path) -> list[Frame]:
 
 
 def replay(frames: list[Frame], speed: float) -> None:
-    fig, ax = plt.subplots(figsize=(9, 7))
-    fig.subplots_adjust(bottom=0.22)
+    fig, (ax, camera_ax) = plt.subplots(1, 2, figsize=(15, 7))
+    fig.subplots_adjust(bottom=0.22, wspace=0.28)
     all_xy = np.vstack([f.world_points[:, :2] for f in frames if len(f.world_points)] +
                        [np.vstack([f.robot_xyz[:2] for f in frames])])
     low, high = all_xy.min(axis=0), all_xy.max(axis=0)
@@ -87,7 +91,22 @@ def replay(frames: list[Frame], speed: float) -> None:
     points_artist = ax.scatter([], [], s=12, c="tab:green", label="Boundary points")
     robot_artist = ax.scatter([], [], s=65, marker="x", c="tab:red", label="Robot")
     heading_artist, = ax.plot([], [], c="tab:red", lw=2)
+    trend_artist, = ax.plot([], [], c="tab:blue", lw=2, label="Estimated shape")
     ax.legend(loc="upper right")
+
+    camera_xz = np.vstack([f.camera_xz for f in frames if len(f.camera_xz)])
+    camera_low, camera_high = camera_xz.min(axis=0), camera_xz.max(axis=0)
+    camera_padding = np.maximum((camera_high - camera_low) * 0.05, 0.1)
+    camera_ax.set_xlim(camera_low[0] - camera_padding[0], camera_high[0] + camera_padding[0])
+    camera_ax.set_ylim(camera_low[1] - camera_padding[1], camera_high[1] + camera_padding[1])
+    camera_ax.set_aspect("equal", adjustable="box")
+    camera_ax.set_xlabel("Camera X (m)")
+    camera_ax.set_ylabel("Camera Z (m)")
+    camera_ax.grid(True, alpha=0.3)
+    camera_artist = camera_ax.scatter([], [], s=12, c="tab:green", label="Boundary points")
+    camera_trend_artist, = camera_ax.plot([], [], c="tab:blue", lw=2,
+                                          label="Estimated shape")
+    camera_ax.legend(loc="upper right")
 
     slider_ax = fig.add_axes((0.13, 0.12, 0.74, 0.03))
     slider = Slider(slider_ax, "Frame", 1, len(frames), valinit=1, valstep=1)
@@ -99,14 +118,35 @@ def replay(frames: list[Frame], speed: float) -> None:
     def show(index: int) -> None:
         frame = frames[index]
         points_artist.set_offsets(frame.world_points[:, :2])
+        camera_artist.set_offsets(frame.camera_xz)
+        camera_shape = orient_shape(recognize(frame.camera_xz), (0.0, 0.0))
+        if camera_shape is None:
+            camera_trend_artist.set_data([], [])
+            camera_detail = "insufficient shape data"
+        else:
+            camera_trend_artist.set_data(camera_shape.centerline[:, 0],
+                                         camera_shape.centerline[:, 1])
+            camera_detail = (f"{camera_shape.label} | length {camera_shape.length_m:.2f} m | "
+                             f"turn {camera_shape.turn_deg:+.0f} deg | "
+                             f"direction {camera_shape.directions_deg[0]:.0f} deg")
+        camera_ax.set_title(f"Camera XZ | {len(frame.camera_xz)} points\n{camera_detail}")
         robot_artist.set_offsets(frame.robot_xyz[:2].reshape(1, 2))
         origin = frame.robot_xyz[:2]
         # The pose yaw refers to the robot's lateral axis; its forward axis is 90° counterclockwise.
         heading = frame.robot_yaw + np.pi / 2
         tip = origin + 0.25 * np.array([np.cos(heading), np.sin(heading)])
         heading_artist.set_data([origin[0], tip[0]], [origin[1], tip[1]])
+        shape = orient_shape(recognize(frame.world_points), origin)
+        if shape is None:
+            trend_artist.set_data([], [])
+            detail = "insufficient shape data"
+        else:
+            trend_artist.set_data(shape.centerline[:, 0], shape.centerline[:, 1])
+            detail = (f"{shape.label} | length {shape.length_m:.2f} m | "
+                      f"turn {shape.turn_deg:+.0f} deg | "
+                      f"direction {shape.directions_deg[0]:.0f} deg")
         ax.set_title(f"Frame {index + 1}/{len(frames)} | {frame.clock} | "
-                     f"{len(frame.world_points)} points")
+                     f"{len(frame.world_points)} points\n{detail}")
         fig.canvas.draw_idle()
 
     slider.on_changed(lambda value: show(int(value) - 1))
