@@ -64,12 +64,22 @@ def recognize(points_xyz, bins=24):
             if mask.sum() >= 3:
                 j = np.argmin(np.abs(t - np.median(along_good[mask])))
                 offsets[j] = np.median(across_good[mask])
-    # Fit a low-order curve to bin medians so individual noisy bins cannot
-    # create artificial turns or S bends.
+    # Fit the most expressive curve whose radius of curvature stays safely
+    # above the 0.4 m tracking offset. An inner offset of a tighter bend can
+    # form a cusp or loop, so fall back to a simpler trend when necessary.
     normalized_t = 2 * (t - t[0]) / (t[-1] - t[0]) - 1
-    coefficients = np.polyfit(normalized_t, offsets, deg=3)
-    smooth = np.polyval(coefficients, normalized_t)
-    line = center + t[:, None] * axis + smooth[:, None] * normal
+    sample_t = np.linspace(t[0], t[-1], 64)
+    sample_s = 2 * (sample_t - t[0]) / (t[-1] - t[0]) - 1
+    dt_scale = 2 / (t[-1] - t[0])
+    for degree in (3, 2, 1):
+        coefficients = np.polyfit(normalized_t, offsets, deg=degree)
+        slope = np.polyval(np.polyder(coefficients), sample_s) * dt_scale
+        bend = np.polyval(np.polyder(coefficients, 2), sample_s) * dt_scale ** 2
+        curvature = np.abs(bend) / (1 + slope ** 2) ** 1.5
+        if np.max(curvature) <= 1.5 or degree == 1:
+            break
+    smooth = np.polyval(coefficients, sample_s)
+    line = center + sample_t[:, None] * axis + smooth[:, None] * normal
     segments = np.diff(line, axis=0)
     lengths = np.linalg.norm(segments, axis=1)
     if np.any(lengths <= 1e-6):
@@ -110,3 +120,25 @@ def orient_shape(shape, robot_xy):
                  shape.length_m, -shape.turn_deg,
                  {"left bend": "right bend", "right bend": "left bend"}.get(shape.label, shape.label),
                  shape.median_error_m)
+
+
+def tracking_reference(shape, robot_xy, offset_m=0.4):
+    """Offset each fitted XY point by offset_m along its normal toward the robot.
+
+    The side is selected using the whole line's chord, then kept consistent
+    along the curve. Returns None when no shape is available.
+    """
+    if shape is None:
+        return None
+    if offset_m < 0:
+        raise ValueError("offset_m must be nonnegative")
+    line = shape.centerline
+    tangent = np.gradient(line, axis=0)
+    tangent /= np.linalg.norm(tangent, axis=1)[:, None]
+    left_normal = np.column_stack((-tangent[:, 1], tangent[:, 0]))
+    robot_xy = np.asarray(robot_xy, dtype=float)[:2]
+    chord = line[-1] - line[0]
+    chord_normal = np.array([-chord[1], chord[0]]) / np.linalg.norm(chord)
+    side = np.dot(robot_xy - line[0], chord_normal)
+    sign = 1 if side >= 0 else -1
+    return line + sign * offset_m * left_normal
