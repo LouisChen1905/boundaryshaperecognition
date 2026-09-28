@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 import re
 from typing import Optional
@@ -101,10 +103,55 @@ def camera_xz_to_global_xy(camera_xz: np.ndarray, frame: Frame) -> np.ndarray:
 
 
 def load_frames(path: Path) -> list[Frame]:
+    if path.suffix.lower() == ".jsonl":
+        return load_data_package(path)
     with path.open("r", encoding="utf-8") as source:
         frames = [parse_frame(line, number) for number, line in enumerate(source, 1)]
     if not frames:
         raise ValueError("The log is empty")
+    return frames
+
+
+def load_data_package(path: Path) -> list[Frame]:
+    """Read JSONL records and pair visual samples with the latest pose."""
+    frames = []
+    pose = None
+    with path.open("r", encoding="utf-8-sig") as source:
+        for number, line in enumerate(source, 1):
+            try:
+                record = json.loads(line)
+                topic = record.get("topic")
+                data = record.get("data", {})
+                if topic == "location":
+                    position = data["poseOI"]["position"]
+                    attitude = data["poseOI"]["attitude"]
+                    pose = (np.array([position["east"], position["north"], position["up"]], dtype=float),
+                            np.array([attitude["roll"], attitude["pitch"], attitude["head"]], dtype=float))
+                elif topic == "visual_boundary_points" and pose is not None:
+                    def points(key, count_key):
+                        count = int(data[count_key])
+                        values = data[key]
+                        if count < 0 or count > len(values):
+                            raise ValueError(f"{count_key} exceeds available points")
+                        return np.array([[p["cornerX"], p["cornerZ"]]
+                                         for p in values[:count]], dtype=float).reshape(-1, 2)
+
+                    boundary = points("vBoundaryPoints", "boundary_num")
+                    grass = points("vGrassPoints", "grass_num")
+                    xyz, rpy = pose
+                    camera_points = np.zeros((len(boundary), 3))
+                    camera_points[:, (0, 2)] = boundary
+                    world = (camera_points @ rotation(*CAMERA_RPY).T + CAMERA_TRANSLATION)
+                    world = world @ rotation(*rpy).T + xyz
+                    timestamp = float(data.get("timestamp", record["system_ms"])) / 1000
+                    clock = datetime.fromtimestamp(timestamp).strftime("%H:%M:%S.%f")[:-3]
+                    frame = Frame(clock, timestamp, xyz.copy(), rpy.copy(), rpy[2], boundary, world)
+                    frame.grass_world_xy = camera_xz_to_global_xy(grass, frame)
+                    frames.append(frame)
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+                raise ValueError(f"Line {number}: invalid navigation data: {error}") from error
+    if not frames:
+        raise ValueError("No visual boundary frames with location in the data package")
     return frames
 
 
