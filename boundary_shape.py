@@ -15,7 +15,7 @@ class Shape:
     median_error_m: float
 
 
-def recognize(points_xyz, bins=24):
+def recognize(points_xyz, bins=24, max_curvature=1.5):
     """Return a robust XY trend, or None if the cloud has too little support.
 
     The centerline runs from its endpoint nearer the robot to the farther one
@@ -23,6 +23,8 @@ def recognize(points_xyz, bins=24):
     its sign follows the dominant global X (or Y) axis.
     """
     xy = np.asarray(points_xyz, dtype=float)[:, :2]
+    if max_curvature <= 0:
+        raise ValueError("max_curvature must be positive")
     xy = xy[np.isfinite(xy).all(axis=1)]
     if len(xy) < 12:
         return None
@@ -76,7 +78,7 @@ def recognize(points_xyz, bins=24):
         slope = np.polyval(np.polyder(coefficients), sample_s) * dt_scale
         bend = np.polyval(np.polyder(coefficients, 2), sample_s) * dt_scale ** 2
         curvature = np.abs(bend) / (1 + slope ** 2) ** 1.5
-        if np.max(curvature) <= 1.5 or degree == 1:
+        if np.max(curvature) <= max_curvature or degree == 1:
             break
     smooth = np.polyval(coefficients, sample_s)
     line = center + sample_t[:, None] * axis + smooth[:, None] * normal
@@ -122,11 +124,44 @@ def orient_shape(shape, robot_xy):
                  shape.median_error_m)
 
 
-def tracking_reference(shape, robot_xy, offset_m=0.4):
-    """Offset each fitted XY point by offset_m along its normal toward the robot.
+def reference_side(shape, robot_xy, grass_points=None):
+    """Choose the likely lawn side of a boundary; return (sign, evidence).
 
-    The side is selected using the whole line's chord, then kept consistent
-    along the curve. Returns None when no shape is available.
+    Grass points, when supplied in the same XY plane, take priority. Without
+    them the robot position is used as a provisional interior-side cue.
+    """
+    line = shape.centerline
+    chord = line[-1] - line[0]
+    axis = chord / np.linalg.norm(chord)
+    normal = np.array([-axis[1], axis[0]])
+    if grass_points is not None:
+        grass = np.asarray(grass_points, dtype=float)
+        if grass.size == 0:
+            grass = np.empty((0, 2))
+        elif grass.ndim != 2 or grass.shape[1] < 2:
+            raise ValueError("grass_points must contain XY coordinates")
+        grass = grass[:, :2]
+        grass = grass[np.isfinite(grass).all(axis=1)]
+        along = (grass - line[0]) @ axis
+        usable = grass[(along >= -0.2) & (along <= np.linalg.norm(chord) + 0.2)]
+        if len(usable) >= 5:
+            signed = (usable - line[0]) @ normal
+            significant = signed[np.abs(signed) >= 0.05]
+            if len(significant) >= 5:
+                positive_fraction = np.mean(significant > 0)
+                if positive_fraction >= 0.7:
+                    return 1, "grass"
+                if positive_fraction <= 0.3:
+                    return -1, "grass"
+    side = np.dot(np.asarray(robot_xy, dtype=float)[:2] - line[0], normal)
+    return (1 if side >= 0 else -1), "robot"
+
+
+def tracking_reference(shape, robot_xy, offset_m=0.4, grass_points=None):
+    """Offset each fitted XY point along its normal toward the lawn interior.
+
+    The side is selected by grass points when available, otherwise by the
+    robot position. Returns None when no shape is available.
     """
     if shape is None:
         return None
@@ -137,8 +172,67 @@ def tracking_reference(shape, robot_xy, offset_m=0.4):
     tangent /= np.linalg.norm(tangent, axis=1)[:, None]
     left_normal = np.column_stack((-tangent[:, 1], tangent[:, 0]))
     robot_xy = np.asarray(robot_xy, dtype=float)[:2]
-    chord = line[-1] - line[0]
-    chord_normal = np.array([-chord[1], chord[0]]) / np.linalg.norm(chord)
-    side = np.dot(robot_xy - line[0], chord_normal)
-    sign = 1 if side >= 0 else -1
+    sign, _ = reference_side(shape, robot_xy, grass_points)
     return line + sign * offset_m * left_normal
+
+
+def orient_tracking_reference(reference, boundary):
+    """Order the reference so the corresponding boundary stays on its right."""
+    if reference is None:
+        return None
+    tangent = np.gradient(reference, axis=0)
+    toward_boundary = boundary - reference
+    cross = tangent[:, 0] * toward_boundary[:, 1] - tangent[:, 1] * toward_boundary[:, 0]
+    return reference[::-1].copy() if np.median(cross) > 0 else reference
+
+
+def grass_inside_support(reference, grass_points):
+    """Fraction of nearby grass samples left of the directed reference.
+
+    Returns None when fewer than five usable grass points are available. This
+    is observational support, not proof of continuous lawn coverage.
+    """
+    if reference is None or grass_points is None:
+        return None
+    grass = np.asarray(grass_points, dtype=float)
+    if grass.size == 0:
+        return None
+    if grass.ndim != 2 or grass.shape[1] < 2:
+        raise ValueError("grass_points must contain XY coordinates")
+    grass = grass[np.isfinite(grass[:, :2]).all(axis=1), :2]
+    if len(grass) < 5:
+        return None
+    chord = reference[-1] - reference[0]
+    length = np.linalg.norm(chord)
+    axis = chord / length
+    along = (grass - reference[0]) @ axis
+    grass = grass[(along >= -0.2) & (along <= length + 0.2)]
+    if len(grass) < 5:
+        return None
+    distances = np.linalg.norm(grass[:, None, :] - reference[None, :, :], axis=2)
+    nearest = np.argmin(distances, axis=1)
+    tangents = np.gradient(reference, axis=0)[nearest]
+    offsets = grass - reference[nearest]
+    cross = tangents[:, 0] * offsets[:, 1] - tangents[:, 1] * offsets[:, 0]
+    significant = cross[np.abs(cross) > 0.05 * np.linalg.norm(tangents, axis=1)]
+    return float(np.mean(significant > 0)) if len(significant) >= 5 else None
+
+
+def grass_reference_coverage(reference, grass_points, radius_m=0.25):
+    """Fraction of reference samples with a grass point within radius_m."""
+    if radius_m <= 0:
+        raise ValueError("radius_m must be positive")
+    if reference is None or grass_points is None:
+        return None
+    grass = np.asarray(grass_points, dtype=float)
+    if grass.size == 0:
+        return None
+    if grass.ndim != 2 or grass.shape[1] < 2:
+        raise ValueError("grass_points must contain XY coordinates")
+    grass = grass[np.isfinite(grass[:, :2]).all(axis=1), :2]
+    if len(grass) < 5:
+        return None
+    radius_sq = radius_m ** 2
+    covered = sum(np.min(np.sum((grass - point) ** 2, axis=1)) <= radius_sq
+                  for point in reference)
+    return covered / len(reference)
