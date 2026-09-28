@@ -5,13 +5,16 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import chain
 from pathlib import Path
 import re
 from typing import Optional
 
 import matplotlib.pyplot as plt
+from matplotlib.collections import PolyCollection
 from matplotlib.patches import FancyArrowPatch
 from matplotlib.widgets import Button, Slider
 import numpy as np
@@ -20,6 +23,7 @@ from boundary_shape import (grass_inside_support, grass_reference_coverage,
                             orient_shape,
                             orient_tracking_reference, recognize, reference_side,
                             tracking_reference)
+from boundary_exploration import BoundaryExplorer, ExplorationConfig
 
 
 LOG_PATTERN = re.compile(
@@ -42,6 +46,8 @@ class Frame:
     camera_xz: np.ndarray
     world_points: np.ndarray
     grass_world_xy: Optional[np.ndarray] = None
+    camera_boundary_xyz: Optional[np.ndarray] = None
+    camera_grass_xyz: Optional[np.ndarray] = None
 
 
 def rotation(roll: float, pitch: float, yaw: float) -> np.ndarray:
@@ -102,6 +108,15 @@ def camera_xz_to_global_xy(camera_xz: np.ndarray, frame: Frame) -> np.ndarray:
     return camera_xz @ xy_basis.T + world_origin[:2]
 
 
+def camera_to_world_matrix(frame: Frame) -> np.ndarray:
+    """Full camera XYZ to global XYZ transform for the exploration input."""
+    robot_rotation = rotation(*frame.robot_rpy)
+    transform = np.eye(4)
+    transform[:3, :3] = robot_rotation @ rotation(*CAMERA_RPY)
+    transform[:3, 3] = frame.robot_xyz + robot_rotation @ CAMERA_TRANSLATION
+    return transform
+
+
 def load_frames(path: Path) -> list[Frame]:
     if path.suffix.lower() == ".jsonl":
         return load_data_package(path)
@@ -112,12 +127,18 @@ def load_frames(path: Path) -> list[Frame]:
     return frames
 
 
-def load_data_package(path: Path) -> list[Frame]:
-    """Read JSONL records and pair visual samples with the latest pose."""
-    frames = []
+def iter_data_package(path: Path, max_records: Optional[int] = None):
+    """Yield visual frames without retaining the JSONL file in memory.
+
+    ``max_records`` limits input records, including nonvisual records. It is
+    useful when inspecting a large or still growing capture.
+    """
     pose = None
+    previous_time = None
     with path.open("r", encoding="utf-8-sig") as source:
         for number, line in enumerate(source, 1):
+            if max_records is not None and number > max_records:
+                break
             try:
                 record = json.loads(line)
                 topic = record.get("topic")
@@ -133,23 +154,35 @@ def load_data_package(path: Path) -> list[Frame]:
                         values = data[key]
                         if count < 0 or count > len(values):
                             raise ValueError(f"{count_key} exceeds available points")
-                        return np.array([[p["cornerX"], p["cornerZ"]]
-                                         for p in values[:count]], dtype=float).reshape(-1, 2)
+                        return np.array([[p["cornerX"], p["cornerY"], p["cornerZ"]]
+                                         for p in values[:count]], dtype=float).reshape(-1, 3)
 
                     boundary = points("vBoundaryPoints", "boundary_num")
                     grass = points("vGrassPoints", "grass_num")
                     xyz, rpy = pose
-                    camera_points = np.zeros((len(boundary), 3))
-                    camera_points[:, (0, 2)] = boundary
-                    world = (camera_points @ rotation(*CAMERA_RPY).T + CAMERA_TRANSLATION)
+                    world = (boundary @ rotation(*CAMERA_RPY).T + CAMERA_TRANSLATION)
                     world = world @ rotation(*rpy).T + xyz
-                    timestamp = float(data.get("timestamp", record["system_ms"])) / 1000
+                    raw_time = float(data.get("timestamp") or record["system_ms"])
+                    timestamp = raw_time / 1000
+                    if previous_time is not None and timestamp < previous_time:
+                        timestamp = previous_time
+                    previous_time = timestamp
                     clock = datetime.fromtimestamp(timestamp).strftime("%H:%M:%S.%f")[:-3]
-                    frame = Frame(clock, timestamp, xyz.copy(), rpy.copy(), rpy[2], boundary, world)
-                    frame.grass_world_xy = camera_xz_to_global_xy(grass, frame)
-                    frames.append(frame)
+                    frame = Frame(clock, timestamp, xyz.copy(), rpy.copy(), rpy[2],
+                                  boundary[:, (0, 2)], world)
+                    frame.camera_boundary_xyz = boundary
+                    frame.camera_grass_xyz = grass
+                    grass_world = (grass @ rotation(*CAMERA_RPY).T + CAMERA_TRANSLATION)
+                    grass_world = grass_world @ rotation(*rpy).T + xyz
+                    frame.grass_world_xy = grass_world[:, :2]
+                    yield frame
             except (ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
                 raise ValueError(f"Line {number}: invalid navigation data: {error}") from error
+
+
+def load_data_package(path: Path) -> list[Frame]:
+    """Compatibility loader; use ``iter_data_package`` for large files."""
+    frames = list(iter_data_package(path))
     if not frames:
         raise ValueError("No visual boundary frames with location in the data package")
     return frames
@@ -249,6 +282,221 @@ def reference_route_direction(frames: list[Frame], shapes):
         return "Reference route: rotation inconclusive"
     direction = "CCW" if twice_area > 0 else "CW"
     return f"Reference route: {direction} (sampled)"
+
+
+def update_exploration(explorer: BoundaryExplorer, frame: Frame):
+    """Advance the map exactly once for a new frame."""
+    pose = (frame.robot_xyz[0], frame.robot_xyz[1], frame.robot_yaw + np.pi / 2)
+    if frame.camera_boundary_xyz is not None:
+        return explorer.update(frame.camera_grass_xyz, frame.camera_boundary_xyz,
+                               pose, frame.timestamp,
+                               sensor_to_world=camera_to_world_matrix(frame))
+    grass = frame.grass_world_xy
+    return explorer.update(grass if grass is not None else np.empty((0, 2)),
+                           frame.world_points[:, :2], pose, frame.timestamp)
+
+
+def _cell_polygons(cells, resolution):
+    if not cells:
+        return np.empty((0, 4, 2))
+    origins = np.asarray(list(cells), dtype=float) * resolution
+    corners = np.array([[0, 0], [1, 0], [1, 1], [0, 1]]) * resolution
+    return origins[:, None, :] + corners[None, :, :]
+
+
+def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
+                              verified_start_radius=None, history_size=50) -> None:
+    """Replay an iterator incrementally and display the explorer's live map.
+
+    Previous/Next use a bounded cache. Revisiting a cached frame never feeds
+    that observation into the explorer a second time.
+    """
+    frame_iter = iter(frames)
+    first = next(frame_iter, None)
+    if first is None:
+        raise ValueError("No visual boundary frames with location in the data package")
+    source = chain((first,), frame_iter)
+    explorer = BoundaryExplorer(config)
+    if verified_start_radius is not None:
+        explorer.seed_verified_grass_disk(first.robot_xyz[:2], verified_start_radius)
+
+    fig, (ax, camera_ax) = plt.subplots(1, 2, figsize=(15, 7))
+    fig.subplots_adjust(bottom=0.16, top=0.88, wspace=0.28)
+    fig.suptitle("Boundary exploration replay | gray: unknown, green: confirmed grass, "
+                 "red: boundary, teal: safe", fontsize=11)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Global X (m)")
+    ax.set_ylabel("Global Y (m)")
+    ax.set_facecolor("#eeeeee")
+    ax.grid(True, alpha=0.2)
+    grass_cells = PolyCollection([], facecolors="#a6d854", edgecolors="none",
+                                 alpha=0.75, zorder=1, label="Confirmed grass")
+    safe_cells = PolyCollection([], facecolors="#27aeae", edgecolors="none",
+                                alpha=0.7, zorder=2, label="Robot-center safe")
+    boundary_cells = PolyCollection([], facecolors="#cf4446", edgecolors="none",
+                                    alpha=0.9, zorder=3, label="Observed boundary")
+    for collection in (grass_cells, safe_cells, boundary_cells):
+        ax.add_collection(collection)
+    raw_points = ax.scatter([], [], s=8, c="darkgreen", alpha=0.5,
+                            label="Current boundary points", zorder=4)
+    robot = ax.scatter([], [], s=90, marker="x", c="black", label="Robot", zorder=6)
+    goal = ax.scatter([], [], s=110, marker="*", c="#e69f00",
+                      label="Next viewing pose", zorder=7)
+    path_line, = ax.plot([], [], c="#e69f00", lw=2.5, label="Safe path", zorder=5)
+    shape_line, = ax.plot([], [], c="tab:blue", lw=1.5,
+                          label="Single-frame fit", zorder=5)
+    status_text = ax.text(0.02, 0.02, "", transform=ax.transAxes, va="bottom",
+                          fontsize=9, bbox={"facecolor": "white", "alpha": 0.85,
+                                             "edgecolor": "none"}, zorder=8)
+    ax.legend(loc="upper right", fontsize=8)
+
+    camera_ax.set_aspect("equal", adjustable="box")
+    camera_ax.set_xlabel("Camera X (m)")
+    camera_ax.set_ylabel("Camera Z (m)")
+    camera_ax.grid(True, alpha=0.3)
+    camera_points = camera_ax.scatter([], [], s=10, c="darkgreen", label="Boundary")
+    camera_grass = camera_ax.scatter([], [], s=8, c="#a6d854", alpha=0.6,
+                                     label="Grass")
+    camera_shape, = camera_ax.plot([], [], c="tab:blue", lw=2,
+                                   label="Single-frame fit")
+    camera_ax.legend(loc="upper right", fontsize=8)
+
+    previous_button = Button(fig.add_axes((0.18, 0.04, 0.15, 0.06)), "Previous")
+    play_button = Button(fig.add_axes((0.42, 0.04, 0.15, 0.06)), "Pause")
+    next_button = Button(fig.add_axes((0.66, 0.04, 0.15, 0.06)), "Next")
+    history = deque(maxlen=history_size)
+    state = {"index": -1, "playing": True, "ended": False, "number": 0,
+             "previous_time": None}
+
+    def show(entry):
+        number, frame, result = entry
+        resolution = config.resolution
+        grass_cells.set_verts(_cell_polygons(result.known_grass, resolution))
+        safe_cells.set_verts(_cell_polygons(result.safe_cells, resolution))
+        boundary_cells.set_verts(_cell_polygons(result.boundary_cells, resolution))
+        raw_points.set_offsets(frame.world_points[:, :2])
+        robot.set_offsets(frame.robot_xyz[:2].reshape(1, 2))
+        if result.goal_pose is None:
+            goal.set_offsets(np.empty((0, 2)))
+        else:
+            goal.set_offsets(np.asarray(result.goal_pose[:2]).reshape(1, 2))
+        path_line.set_data(result.path_xy[:, 0], result.path_xy[:, 1])
+        shape = orient_shape(recognize(frame.world_points), frame.robot_xyz[:2])
+        if shape is None:
+            shape_line.set_data([], [])
+        else:
+            shape_line.set_data(shape.centerline[:, 0], shape.centerline[:, 1])
+        camera_points.set_offsets(frame.camera_xz)
+        camera_grass.set_offsets(frame.camera_grass_xyz[:, (0, 2)]
+                                 if frame.camera_grass_xyz is not None
+                                 else np.empty((0, 2)))
+        camera_fit = orient_shape(recognize(frame.camera_xz), (0, 0))
+        if camera_fit is None:
+            camera_shape.set_data([], [])
+        else:
+            camera_shape.set_data(camera_fit.centerline[:, 0],
+                                  camera_fit.centerline[:, 1])
+        camera_ax.set_title(f"Camera XZ | {len(frame.camera_xz)} boundary points")
+        camera_cloud = frame.camera_xz
+        if frame.camera_grass_xyz is not None and len(frame.camera_grass_xyz):
+            camera_cloud = np.vstack((camera_cloud,
+                                      frame.camera_grass_xyz[:, (0, 2)]))
+        if len(camera_cloud):
+            low, high = camera_cloud.min(axis=0), camera_cloud.max(axis=0)
+            camera_ax.set_xlim(low[0] - 0.3, high[0] + 0.3)
+            camera_ax.set_ylim(low[1] - 0.3, high[1] + 0.3)
+        status_text.set_text(
+            f"{result.status}: {result.reason}\n"
+            f"Grass {len(result.known_grass)} | Boundary {len(result.boundary_cells)} "
+            f"| Safe {len(result.safe_cells)}\n"
+            f"New grass {result.new_grass_cells} | New boundary {result.new_boundary_cells} "
+            f"| Closed {result.boundary_closed}")
+        ax.set_title(f"Frame {number} | {frame.clock} | exploration: {result.status}")
+        extent = [frame.robot_xyz[:2]]
+        if len(frame.world_points):
+            extent.append(frame.world_points[:, :2])
+        if result.known_grass or result.boundary_cells:
+            extent.append(np.asarray(list(result.known_grass | result.boundary_cells))
+                          * resolution)
+        if result.goal_pose is not None:
+            extent.append(np.asarray(result.goal_pose[:2]).reshape(1, 2))
+        cloud = np.vstack(extent)
+        low, high = cloud.min(axis=0), cloud.max(axis=0)
+        center = (low + high) / 2
+        radius = max(0.75, max(high - low) / 2 + 0.4)
+        ax.set_xlim(center[0] - radius, center[0] + radius)
+        ax.set_ylim(center[1] - radius, center[1] + radius)
+        fig.canvas.draw_idle()
+
+    def advance():
+        if state["index"] + 1 < len(history):
+            state["index"] += 1
+            show(history[state["index"]])
+            return True
+        if state["ended"]:
+            return False
+        frame = next(source, None)
+        if frame is None:
+            state["ended"] = True
+            return False
+        result = update_exploration(explorer, frame)
+        state["number"] += 1
+        history.append((state["number"], frame, result))
+        state["index"] = len(history) - 1
+        if state["previous_time"] is not None:
+            delay = (frame.timestamp - state["previous_time"]) * 1000 / speed
+            timer.interval = max(20, min(1000, int(delay))) if delay > 0 else 100
+        state["previous_time"] = frame.timestamp
+        show(history[-1])
+        return True
+
+    timer = fig.canvas.new_timer(interval=max(20, int(100 / speed)))
+
+    def tick():
+        if state["playing"] and not advance():
+            state["playing"] = False
+            play_button.label.set_text("Play")
+        if state["playing"]:
+            timer.start()
+
+    timer.add_callback(tick)
+
+    def toggle(event):
+        state["playing"] = not state["playing"]
+        play_button.label.set_text("Pause" if state["playing"] else "Play")
+        if state["playing"]:
+            timer.start()
+        else:
+            timer.stop()
+        fig.canvas.draw_idle()
+
+    def previous(event):
+        if state["index"] > 0:
+            state["index"] -= 1
+            show(history[state["index"]])
+
+    play_button.on_clicked(toggle)
+    previous_button.on_clicked(previous)
+    next_button.on_clicked(lambda event: advance())
+
+    def on_key(event):
+        if event.key == "left":
+            previous(event)
+        elif event.key == "right":
+            advance()
+        elif event.key == " ":
+            toggle(event)
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
+    advance()
+    timer.start()
+    try:
+        plt.show()
+    finally:
+        timer.stop()
+        close = getattr(frame_iter, "close", None)
+        if close is not None:
+            close()
 
 
 def replay(frames: list[Frame], speed: float, min_turn_radius=None,
@@ -482,6 +730,16 @@ def main() -> None:
                              help="Distance from robot center to right body edge in meters")
     parser.add_argument("--grass-support-radius", type=float, default=0.25,
                         help="Distance in meters used to count grass coverage near reference")
+    parser.add_argument("--max-records", type=int,
+                        help="Read at most this many JSONL input records")
+    parser.add_argument("--exploration-robot-radius", type=float, default=0.2,
+                        help="Exploration footprint radius in meters (demo default: 0.2)")
+    parser.add_argument("--exploration-sensor-range", type=float, default=2.0,
+                        help="Exploration sensor range in meters (demo default: 2.0)")
+    parser.add_argument("--grid-resolution", type=float, default=0.1,
+                        help="Exploration map cell size in meters")
+    parser.add_argument("--verified-start-radius", type=float,
+                        help="Optional externally verified grass disk around first pose")
     args = parser.parse_args()
     if args.speed <= 0:
         parser.error("--speed must be positive")
@@ -493,6 +751,24 @@ def main() -> None:
         parser.error("--right-half-width must be positive")
     if args.grass_support_radius <= 0:
         parser.error("--grass-support-radius must be positive")
+    if args.max_records is not None and args.max_records <= 0:
+        parser.error("--max-records must be positive")
+    if args.verified_start_radius is not None and args.verified_start_radius <= 0:
+        parser.error("--verified-start-radius must be positive")
+    try:
+        exploration_config = ExplorationConfig(
+            robot_radius=args.exploration_robot_radius,
+            sensor_range=args.exploration_sensor_range,
+            resolution=args.grid_resolution)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.log.suffix.lower() == ".jsonl":
+        if args.grass_csv:
+            parser.error("--grass-csv is only supported for the text log replay")
+        replay_exploration_stream(iter_data_package(args.log, args.max_records),
+                                  args.speed, exploration_config,
+                                  args.verified_start_radius)
+        return
     frames = load_frames(args.log)
     if args.grass_csv:
         load_grass_csv(args.grass_csv, frames)

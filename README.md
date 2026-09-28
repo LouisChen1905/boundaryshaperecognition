@@ -1,10 +1,52 @@
 # Boundary shape recognition
 
+## Grass-only boundary exploration
+
+`boundary_exploration.py` is an independent, stateful grid explorer. Create
+`BoundaryExplorer(ExplorationConfig(robot_radius=..., sensor_range=...))`, then
+call `update(grass_points, boundary_points, (x, y, yaw), timestamp)` for each
+time-aligned frame. Two-column point arrays are global XY. Three-column camera
+XYZ arrays require a full 4x4 `sensor_to_world` transform; camera Y is not
+discarded. The result contains the sparse known-grass, boundary, and safe-cell
+sets, a boundary-closure flag, the next observation pose and a path, or a
+status explaining why no path is available. Unknown cells are implicit and
+never traversable. Evidence is counted once per cell per frame; grass needs
+two observations by default, while even one boundary observation blocks a
+cell. Consecutive boundary points are connected only across gaps no larger
+than `boundary_link_gap`.
+
+```python
+from boundary_exploration import BoundaryExplorer, ExplorationConfig
+
+explorer = BoundaryExplorer(ExplorationConfig(robot_radius=0.2, sensor_range=2.0))
+result = explorer.update(grass_world_xy, boundary_world_xy,
+                         (robot_x, robot_y, robot_yaw), timestamp_s)
+if result.status == "exploring":
+    send_goal_to_local_planner(result.goal_pose, result.path_xy)
+```
+
+The robot's circular footprint, pose margin, and boundary clearance are
+applied before routing. Goals are selected from reachable safe cells for
+their view of grass-to-unknown frontiers, with extra weight near observed
+boundary. `trajectory_is_safe` and `command_is_safe` check a local planner's
+proposed motion before execution. If the sensor cannot confirm grass beneath
+the robot at startup, the explorer returns `waiting_for_observation`; an
+externally verified initial grass disk can be supplied explicitly through
+`seed_verified_grass_disk`. A pose alone does not certify grass. The algorithm
+uses a circular footprint and a finite-range sensor model; callers must supply
+calibrated dimensions, localization uncertainty, and camera extrinsics. A
+closed confirmed boundary reports `complete`; an open contour with no reachable
+safe viewpoint reports `incomplete_unreachable`. Input timestamps must be
+monotonic; skip malformed or zero-timestamp sensor packets before calling
+`update`.
+
 Detailed fitting steps and direction conventions are documented in [拟合算法说明.md](拟合算法说明.md).
 
 Run `python replay_boundary.py` to load the log and replay each frame simultaneously in global XY (left) and camera XZ (right) coordinates. The green dots are measured boundary points, the blue curves are independently estimated boundary trends, and the bright orange arrows and labels show the **tracking reference direction** near each purple curve's midpoint. The red marker and line show the robot position and heading in the global view. Both views use the same frame controls: Play/Pause, Previous/Next, the slider, or the left/right arrow keys. `--speed 2` plays at twice the logged rate.
 
-Navigation data packages in JSONL format can also be loaded directly: `python replay_boundary.py "D:\Downloads\0047X\navigation-data.jsonl"`. The importer reads the entire file, uses `visual_boundary_points` records with the latest preceding `location` pose, and takes only the valid `boundary_num` and `grass_num` points from each record. If no usable boundary frame appears, it reports an error.
+Navigation data packages in JSONL format use a live exploration replay. For a bounded inspection of the supplied large file, run `python replay_boundary.py "D:\Downloads\0047X\navigation-data.jsonl" --max-records 1000`. The reader streams records and pairs each `visual_boundary_points` packet with the latest preceding `location` pose. Full camera XYZ coordinates are transformed into global XY before updating `BoundaryExplorer`; zero sensor timestamps fall back to the packet system time. Only the current map and 50 recent frame snapshots are retained. The left view shows confirmed grass (light green), observed boundary (red), robot-center safe cells (teal), the robot, a selected goal and safe path when available, and the original single-frame fit (blue). The right view shows camera boundary and grass points. Play/Pause, Previous/Next and arrow keys work with the bounded history; moving backward only displays a cached result and does not add evidence again. `--speed 2` doubles playback speed.
+
+The replay uses example values `--exploration-robot-radius 0.2` and `--exploration-sensor-range 2.0`; set these to measured values before interpreting goals or paths. `--grid-resolution` controls map detail. If the starting grass patch has been independently verified, `--verified-start-radius R` seeds that patch. Without verified grass under the robot, the replay correctly reports `waiting_for_observation` even if grass is visible farther ahead. The JSONL replay displays exploration output but does not send commands to a robot.
 
 The dashed purple line is one tracking reference shown in both views. It is computed in global XY by moving each fitted boundary point 0.4 m along its local normal toward the lawn side. Its point order is then chosen so the boundary lies on the **right** of the tracking direction. On a closed outer lawn boundary, this corresponds to counterclockwise travel with lawn on the left. Grass points determine the lawn side when available; otherwise the robot position is a provisional interior-side estimate, marked as such in the plot. Curves with bends too tight for a smooth 0.4 m inner offset fall back to a simpler trend. Consecutive frames with nearly unchanged robot position and yaw are fitted together to keep the reference stable while the robot is stationary. The global reference is then mapped into camera XZ using that frame's pose and camera extrinsics, assuming camera Y=0 as for the logged points. It is not a separate 0.4 m offset of the camera XZ fit.
 
