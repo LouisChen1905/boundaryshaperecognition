@@ -1,6 +1,7 @@
 """Integration checks for incremental JSONL exploration replay."""
 
 import json
+import csv
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ import numpy as np
 
 from boundary_exploration import BoundaryExplorer, ExplorationConfig
 from replay_boundary import (camera_to_world_matrix, iter_data_package,
+                             profile_exploration_stream,
                              replay_exploration_stream, update_exploration)
 
 
@@ -56,15 +58,40 @@ class ReplayExplorationTests(unittest.TestCase):
                 for record in (location, visual, visual):
                     target.write(json.dumps(record) + "\n")
             frames = iter_data_package(path)
+            timing_path = Path(folder) / "timing.csv"
             with patch.object(plt, "show"):
                 replay_exploration_stream(frames, 1.0,
-                                          ExplorationConfig(0.1, 2.0))
+                                          ExplorationConfig(0.1, 2.0),
+                                          performance_log=timing_path)
             figure = plt.gcf()
             self.assertIn("Frame 1", figure.axes[0].get_title())
             self.assertIn("waiting_for_observation",
                           figure.axes[0].get_title())
             self.assertEqual(len(figure.axes[0].collections[2].get_paths()), 1)
+            with timing_path.open("r", encoding="utf-8", newline="") as source:
+                rows = list(csv.DictReader(source))
+            self.assertEqual(len(rows), 1)
+            self.assertGreater(float(rows[0]["render_ms"]), 0)
+            self.assertGreater(float(rows[0]["update_ms"]), 0)
             plt.close(figure)
+
+    def test_headless_profile_writes_every_visual_frame(self):
+        location, visual = self._records()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "small.jsonl"
+            timing_path = Path(folder) / "timing.csv"
+            with path.open("w", encoding="utf-8") as target:
+                for record in (location, visual, visual):
+                    target.write(json.dumps(record) + "\n")
+            count, totals, maximum = profile_exploration_stream(
+                iter_data_package(path), ExplorationConfig(0.1, 2.0), timing_path)
+            with timing_path.open("r", encoding="utf-8", newline="") as source:
+                rows = list(csv.DictReader(source))
+        self.assertEqual(count, 2)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1]["render_ms"], "")
+        self.assertGreater(totals["raster_ms"], 0)
+        self.assertGreater(maximum, 0)
 
 
 if __name__ == "__main__":

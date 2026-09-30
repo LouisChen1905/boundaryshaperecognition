@@ -40,6 +40,16 @@ safe viewpoint reports `incomplete_unreachable`. Input timestamps must be
 monotonic; skip malformed or zero-timestamp sensor packets before calling
 `update`.
 
+Goal search expands a single safe-grid shortest-path search through configurable
+path radii (default 1, 2, and 3 m). Each stage scores only nearby frontiers via
+spatial buckets. It stops when a viewpoint sees at least `min_visible_gain`
+(default 2 weighted frontier units) and retains a positive score after repeat
+visit penalties. If no stage qualifies, it searches all reachable safe cells
+and returns the highest-scoring visible viewpoint, if one exists. Set
+`path_radii` and `min_visible_gain` in `ExplorationConfig`, or use
+`--goal-path-radii 1 2 3` and `--min-visible-gain 2` in the JSONL replay.
+These defaults are starting values; calibrate them against representative logs.
+
 Detailed fitting steps and direction conventions are documented in [拟合算法说明.md](拟合算法说明.md).
 
 Run `python replay_boundary.py` to load the log and replay each frame simultaneously in global XY (left) and camera XZ (right) coordinates. The green dots are measured boundary points, the blue curves are independently estimated boundary trends, and the bright orange arrows and labels show the **tracking reference direction** near each purple curve's midpoint. The red marker and line show the robot position and heading in the global view. Both views use the same frame controls: Play/Pause, Previous/Next, the slider, or the left/right arrow keys. `--speed 2` plays at twice the logged rate.
@@ -47,6 +57,14 @@ Run `python replay_boundary.py` to load the log and replay each frame simultaneo
 Navigation data packages in JSONL format use a live exploration replay. For a bounded inspection of the supplied large file, run `python replay_boundary.py "D:\Downloads\0047X\navigation-data.jsonl" --max-records 1000`. The reader streams records and pairs each `visual_boundary_points` packet with the latest preceding `location` pose. Full camera XYZ coordinates are transformed into global XY before updating `BoundaryExplorer`; zero sensor timestamps fall back to the packet system time. Only the current map and 50 recent frame snapshots are retained. The left view shows confirmed grass (light green), observed boundary (red), robot-center safe cells (teal), the robot, a selected goal and safe path when available, and the original single-frame fit (blue). The right view shows camera boundary and grass points. Play/Pause, Previous/Next and arrow keys work with the bounded history; moving backward only displays a cached result and does not add evidence again. `--speed 2` doubles playback speed.
 
 The replay uses example values `--exploration-robot-radius 0.2` and `--exploration-sensor-range 2.0`; set these to measured values before interpreting goals or paths. `--grid-resolution` controls map detail. If the starting grass patch has been independently verified, `--verified-start-radius R` seeds that patch. Without verified grass under the robot, the replay correctly reports `waiting_for_observation` even if grass is visible farther ahead. The JSONL replay displays exploration output but does not send commands to a robot.
+
+To locate replay stalls, add `--performance-log exploration_performance.csv`. Each visual frame records JSONL reading, coordinate transformation, rasterization, evidence fusion, safe-cell calculation, closure check, goal search, artist updates, and actual canvas rendering in milliseconds, alongside point and cell counts. Rendering is measured with a synchronous canvas draw while logging is enabled, so the log is a diagnostic run and may play more slowly. For algorithm-only timing without a plot, use `--profile-only --max-records 1000 --performance-log exploration_performance.csv`; `artist_update_ms` and `render_ms` are then blank. `callback_ms` covers one UI frame callback, while `update_ms` covers only `BoundaryExplorer.update()`.
+
+Code using `BoundaryExplorer` directly can pass an empty dictionary as `performance=timings` to `update()`; the call fills it with the same algorithm-stage timings and cell counts without writing a file.
+
+For a frame with N input points, G confirmed grass cells, B mapped boundary cells, S safe cells, F grass frontiers, and K footprint offsets, rasterization is approximately O(N), safe-cell checks O(GK), and closure flood-fill O(A) for the bounded map rectangle A. If the robot is on a safe cell, reachable-path search costs O(S log S); goal scoring can cost O(FB + SF L/r), where L is a sightline length and r is grid resolution. This last term can dominate as explored area grows because many candidate viewpoints repeatedly test frontier visibility. Unknown or unsafe start cells skip goal search entirely.
+
+The visibility check stops at the first blocked cell and reuses results between frames while the mapped boundary cells are unchanged. New boundary cells invalidate the cache. Its size is capped at 100,000 viewpoint/frontier pairs. The CSV reports `sight_checks`, `sight_cache_hits`, `goal_search_radius`, and `goal_visible_gain` to support search cost and threshold calibration.
 
 The dashed purple line is one tracking reference shown in both views. It is computed in global XY by moving each fitted boundary point 0.4 m along its local normal toward the lawn side. Its point order is then chosen so the boundary lies on the **right** of the tracking direction. On a closed outer lawn boundary, this corresponds to counterclockwise travel with lawn on the left. Grass points determine the lawn side when available; otherwise the robot position is a provisional interior-side estimate, marked as such in the plot. Curves with bends too tight for a smooth 0.4 m inner offset fall back to a simpler trend. Consecutive frames with nearly unchanged robot position and yaw are fitted together to keep the reference stable while the robot is stationary. The global reference is then mapped into camera XZ using that frame's pose and camera extrinsics, assuming camera Y=0 as for the logged points. It is not a separate 0.4 m offset of the camera XZ fit.
 

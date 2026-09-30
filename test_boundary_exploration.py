@@ -1,6 +1,7 @@
 """Behavioral checks for the independent grass-only boundary explorer."""
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -95,6 +96,109 @@ class BoundaryExplorerTests(unittest.TestCase):
         np.testing.assert_allclose(result, [[1.2, 0.2]])
         with self.assertRaises(ValueError):
             points_to_world_xy(np.array([[1., 0.2, 2.]]))
+
+    def test_fast_sight_check_matches_rasterized_visibility(self):
+        explorer = self.explorer()
+        random = np.random.RandomState(7)
+        for _ in range(300):
+            start = explorer.center(tuple(random.randint(-12, 13, 2)))
+            end = explorer.center(tuple(random.randint(-12, 13, 2)))
+            blocked = {tuple(cell) for cell in random.randint(-12, 13, (15, 2))}
+            expected = not (explorer._raster_segment(start, end) & blocked)
+            self.assertEqual(explorer._sight_clear(start, end, blocked), expected)
+
+    def test_visibility_cache_reuses_clearance_and_invalidates_on_new_boundary(self):
+        explorer = self.explorer()
+        grass = self.grass_square()
+        empty = np.empty((0, 2))
+        explorer.update(grass, empty, (0., 0., 0.), 0.0)
+        first = {}
+        explorer.update(grass, empty, (0., 0., 0.), 0.1, performance=first)
+        self.assertGreater(first["sight_checks"], 0)
+        self.assertEqual(first["sight_cache_hits"], 0)
+        repeated = {}
+        explorer.update(grass, empty, (0., 0., 0.), 0.2, performance=repeated)
+        self.assertEqual(repeated["sight_cache_hits"], repeated["sight_checks"])
+        changed = {}
+        explorer.update(grass, np.array([[0.8, 0.8]]), (0., 0., 0.), 0.3,
+                        performance=changed)
+        self.assertEqual(changed["sight_cache_hits"], 0)
+
+    def test_path_radius_configuration_requires_increasing_positive_finite_values(self):
+        for radii in ((), (0, 1), (2, 1), (1, 1), (1, float("inf")),
+                      (float("nan"),), None):
+            with self.subTest(radii=radii), self.assertRaises(ValueError):
+                ExplorationConfig(0.1, 1.0, path_radii=radii)
+        for gain in (0, -1, float("inf"), float("nan")):
+            with self.subTest(gain=gain), self.assertRaises(ValueError):
+                ExplorationConfig(0.1, 1.0, min_visible_gain=gain)
+
+    def test_search_stops_at_first_qualified_path_radius_and_falls_back(self):
+        for frontier_x, expected_goal, expected_cells in ((2, 1, 2),
+                                                           (3, 2, 3),
+                                                           (6, 5, 7)):
+            with self.subTest(frontier_x=frontier_x):
+                explorer = BoundaryExplorer(ExplorationConfig(
+                    0.1, 1.1, resolution=1.0, goal_spacing=0.1,
+                    path_radii=(1.0, 2.0, 3.0), min_visible_gain=1.0))
+                safe = {(x, 0) for x in range(7)}
+                frontier = (frontier_x, 0)
+                performance = {}
+                with patch.object(explorer, "_frontiers", return_value={frontier}):
+                    goal, path, _ = explorer._goal(
+                        (0.5, 0.5, 0.), safe, set(), safe, performance)
+                self.assertEqual(explorer.cell(goal[:2]), (expected_goal, 0))
+                self.assertEqual(performance["reachable_cells"], expected_cells)
+                self.assertEqual(performance["goal_search_radius"],
+                                 1.0 if frontier_x == 2 else
+                                 2.0 if frontier_x == 3 else "full")
+                self.assertTrue(all(explorer.cell(point) in safe for point in path))
+
+    def test_low_gain_and_repeat_visits_expand_search(self):
+        explorer = BoundaryExplorer(ExplorationConfig(
+            0.1, 2.1, resolution=1.0, goal_spacing=0.1,
+            path_radii=(1.0, 2.0, 3.0), min_visible_gain=2.0))
+        safe = {(x, 0) for x in range(5)}
+        with patch.object(explorer, "_frontiers", return_value={(3, 0), (4, 0)}):
+            goal, path, _ = explorer._goal((0.5, 0.5, 0.), safe, set(), safe)
+        self.assertEqual(explorer.cell(goal[:2]), (2, 0))
+        self.assertTrue(all(explorer.cell(point) in safe for point in path))
+
+    def test_distant_frontiers_are_not_scored_against_local_candidates(self):
+        explorer = BoundaryExplorer(ExplorationConfig(
+            0.1, 1.1, resolution=1.0, goal_spacing=0.1,
+            path_radii=(1.0, 2.0, 3.0), min_visible_gain=1.0))
+        safe = {(x, 0) for x in range(11)}
+        frontiers = {(2, 0)} | {(100 + x, 0) for x in range(100)}
+        performance = {}
+        with patch.object(explorer, "_frontiers", return_value=frontiers):
+            goal, _, _ = explorer._goal((0.5, 0.5, 0.), safe, set(), safe,
+                                        performance)
+        self.assertEqual(explorer.cell(goal[:2]), (1, 0))
+        self.assertLess(performance["candidate_pairs"], 10)
+
+        explorer = BoundaryExplorer(ExplorationConfig(
+            0.1, 1.1, resolution=1.0, goal_spacing=0.1,
+            path_radii=(1.0, 2.0, 3.0), min_visible_gain=1.0))
+        explorer.goal_visits[(1, 0)] = 1
+        with patch.object(explorer, "_frontiers", return_value={(2, 0)}):
+            goal, path, _ = explorer._goal((0.5, 0.5, 0.), safe, set(), safe)
+        self.assertEqual(explorer.cell(goal[:2]), (2, 0))
+        self.assertTrue(all(explorer.cell(point) in safe for point in path))
+
+    def test_radius_uses_safe_path_distance_around_unknown_cells(self):
+        explorer = BoundaryExplorer(ExplorationConfig(
+            0.1, 0.1, resolution=1.0, goal_spacing=0.1,
+            path_radii=(2.0, 3.0), min_visible_gain=1.0))
+        safe = {(0, 0), (1, 0), (2, 0), (2, 1), (2, 2), (1, 2), (0, 2)}
+        performance = {}
+        with patch.object(explorer, "_frontiers", return_value={(0, 2)}):
+            goal, path, _ = explorer._goal((0.5, 0.5, 0.), safe, set(), safe,
+                                          performance)
+        self.assertEqual(explorer.cell(goal[:2]), (0, 2))
+        self.assertEqual(len(path) - 1, 6)
+        self.assertEqual(performance["reachable_cells"], len(safe))
+        self.assertTrue(all(explorer.cell(point) in safe for point in path))
 
 
 if __name__ == "__main__":

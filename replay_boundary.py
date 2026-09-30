@@ -11,6 +11,7 @@ from datetime import datetime
 from itertools import chain
 from pathlib import Path
 import re
+from time import perf_counter_ns
 from typing import Optional
 
 import matplotlib.pyplot as plt
@@ -34,6 +35,15 @@ LOG_PATTERN = re.compile(
 POINT_PATTERN = re.compile(r"\(\s*([^,()]+)\s*,\s*([^,()]+)\s*\)")
 CAMERA_TRANSLATION = np.array([0.4, 0.0, 0.0])
 CAMERA_RPY = (-1.57, 0.0, 0)  # roll, pitch, yaw (radians)
+EXPLORATION_PERFORMANCE_FIELDS = [
+    "frame", "timestamp", "status", "reader_ms", "transform_ms", "raster_ms",
+    "evidence_ms", "safe_ms", "closure_ms", "goal_ms", "goal_reach_ms",
+    "goal_frontier_ms", "goal_score_ms", "snapshot_ms", "update_ms",
+    "artist_update_ms", "render_ms", "callback_ms", "grass_points", "boundary_points",
+    "observed_grass_cells", "observed_boundary_cells", "known_grass_cells",
+    "mapped_boundary_cells", "safe_cells", "reachable_cells", "frontier_cells",
+    "candidate_pairs", "sight_checks", "sight_cache_hits",
+    "goal_search_radius", "goal_visible_gain"]
 
 
 @dataclass
@@ -284,16 +294,19 @@ def reference_route_direction(frames: list[Frame], shapes):
     return f"Reference route: {direction} (sampled)"
 
 
-def update_exploration(explorer: BoundaryExplorer, frame: Frame):
+def update_exploration(explorer: BoundaryExplorer, frame: Frame,
+                       performance=None):
     """Advance the map exactly once for a new frame."""
     pose = (frame.robot_xyz[0], frame.robot_xyz[1], frame.robot_yaw + np.pi / 2)
     if frame.camera_boundary_xyz is not None:
         return explorer.update(frame.camera_grass_xyz, frame.camera_boundary_xyz,
                                pose, frame.timestamp,
-                               sensor_to_world=camera_to_world_matrix(frame))
+                               sensor_to_world=camera_to_world_matrix(frame),
+                               performance=performance)
     grass = frame.grass_world_xy
     return explorer.update(grass if grass is not None else np.empty((0, 2)),
-                           frame.world_points[:, :2], pose, frame.timestamp)
+                           frame.world_points[:, :2], pose, frame.timestamp,
+                           performance=performance)
 
 
 def _cell_polygons(cells, resolution):
@@ -304,21 +317,79 @@ def _cell_polygons(cells, resolution):
     return origins[:, None, :] + corners[None, :, :]
 
 
+def profile_exploration_stream(frames, config: ExplorationConfig,
+                               performance_log: Path,
+                               verified_start_radius=None):
+    """Run the same exploration updates without plotting, writing every frame."""
+    explorer = BoundaryExplorer(config)
+    count = 0
+    totals = {name: 0.0 for name in EXPLORATION_PERFORMANCE_FIELDS
+              if name.endswith("_ms")}
+    maximum_update_ms = 0.0
+    previous_time = None
+    with Path(performance_log).open("w", encoding="utf-8", newline="") as target:
+        writer = csv.DictWriter(target, fieldnames=EXPLORATION_PERFORMANCE_FIELDS)
+        writer.writeheader()
+        source = iter(frames)
+        try:
+            while True:
+                started = perf_counter_ns()
+                frame = next(source, None)
+                reader_ms = (perf_counter_ns() - started) / 1e6
+                if frame is None:
+                    break
+                if previous_time is not None and frame.timestamp < previous_time:
+                    raise ValueError("Navigation frame timestamps must be monotonic")
+                if count == 0 and verified_start_radius is not None:
+                    explorer.seed_verified_grass_disk(frame.robot_xyz[:2],
+                                                      verified_start_radius)
+                performance = {}
+                update_exploration(explorer, frame, performance)
+                count += 1
+                performance.update(frame=count, timestamp=frame.timestamp,
+                                   reader_ms=reader_ms,
+                                   callback_ms=(perf_counter_ns() - started) / 1e6)
+                writer.writerow({name: performance.get(name, "")
+                                 for name in EXPLORATION_PERFORMANCE_FIELDS})
+                for name in totals:
+                    totals[name] += performance.get(name, 0.0)
+                maximum_update_ms = max(maximum_update_ms,
+                                        performance["update_ms"])
+                previous_time = frame.timestamp
+        finally:
+            close = getattr(source, "close", None)
+            if close is not None:
+                close()
+    if count == 0:
+        raise ValueError("No visual boundary frames with location in the data package")
+    return count, totals, maximum_update_ms
+
+
 def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
-                              verified_start_radius=None, history_size=50) -> None:
+                              verified_start_radius=None, history_size=50,
+                              performance_log=None) -> None:
     """Replay an iterator incrementally and display the explorer's live map.
 
     Previous/Next use a bounded cache. Revisiting a cached frame never feeds
     that observation into the explorer a second time.
     """
     frame_iter = iter(frames)
+    first_read_started = perf_counter_ns()
     first = next(frame_iter, None)
+    first_read_ms = (perf_counter_ns() - first_read_started) / 1e6
     if first is None:
         raise ValueError("No visual boundary frames with location in the data package")
     source = chain((first,), frame_iter)
     explorer = BoundaryExplorer(config)
     if verified_start_radius is not None:
         explorer.seed_verified_grass_disk(first.robot_xyz[:2], verified_start_radius)
+    performance_file = None
+    performance_writer = None
+    if performance_log is not None:
+        performance_file = Path(performance_log).open("w", encoding="utf-8", newline="")
+        performance_writer = csv.DictWriter(performance_file,
+                                            fieldnames=EXPLORATION_PERFORMANCE_FIELDS)
+        performance_writer.writeheader()
 
     fig, (ax, camera_ax) = plt.subplots(1, 2, figsize=(15, 7))
     fig.subplots_adjust(bottom=0.16, top=0.88, wspace=0.28)
@@ -368,7 +439,8 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
     state = {"index": -1, "playing": True, "ended": False, "number": 0,
              "previous_time": None}
 
-    def show(entry):
+    def show(entry, performance=None):
+        artist_started = perf_counter_ns()
         number, frame, result = entry
         resolution = config.resolution
         grass_cells.set_verts(_cell_polygons(result.known_grass, resolution))
@@ -426,7 +498,13 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
         radius = max(0.75, max(high - low) / 2 + 0.4)
         ax.set_xlim(center[0] - radius, center[0] + radius)
         ax.set_ylim(center[1] - radius, center[1] + radius)
-        fig.canvas.draw_idle()
+        if performance is None:
+            fig.canvas.draw_idle()
+        else:
+            performance["artist_update_ms"] = (perf_counter_ns() - artist_started) / 1e6
+            render_started = perf_counter_ns()
+            fig.canvas.draw()
+            performance["render_ms"] = (perf_counter_ns() - render_started) / 1e6
 
     def advance():
         if state["index"] + 1 < len(history):
@@ -435,11 +513,15 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
             return True
         if state["ended"]:
             return False
+        callback_started = perf_counter_ns()
+        read_started = callback_started
         frame = next(source, None)
+        reader_ms = (perf_counter_ns() - read_started) / 1e6
         if frame is None:
             state["ended"] = True
             return False
-        result = update_exploration(explorer, frame)
+        performance = {} if performance_writer is not None else None
+        result = update_exploration(explorer, frame, performance)
         state["number"] += 1
         history.append((state["number"], frame, result))
         state["index"] = len(history) - 1
@@ -447,7 +529,18 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
             delay = (frame.timestamp - state["previous_time"]) * 1000 / speed
             timer.interval = max(20, min(1000, int(delay))) if delay > 0 else 100
         state["previous_time"] = frame.timestamp
-        show(history[-1])
+        show(history[-1], performance)
+        if performance_writer is not None:
+            performance["frame"] = state["number"]
+            performance["timestamp"] = frame.timestamp
+            performance["reader_ms"] = (first_read_ms if state["number"] == 1
+                                        else reader_ms)
+            performance["callback_ms"] = ((perf_counter_ns() - callback_started) / 1e6
+                                          + (first_read_ms if state["number"] == 1
+                                             else 0.0))
+            performance_writer.writerow({field: performance.get(field, "")
+                                         for field in EXPLORATION_PERFORMANCE_FIELDS})
+            performance_file.flush()
         return True
 
     timer = fig.canvas.new_timer(interval=max(20, int(100 / speed)))
@@ -494,6 +587,8 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
         plt.show()
     finally:
         timer.stop()
+        if performance_file is not None:
+            performance_file.close()
         close = getattr(frame_iter, "close", None)
         if close is not None:
             close()
@@ -738,8 +833,17 @@ def main() -> None:
                         help="Exploration sensor range in meters (demo default: 2.0)")
     parser.add_argument("--grid-resolution", type=float, default=0.1,
                         help="Exploration map cell size in meters")
+    parser.add_argument("--goal-path-radii", type=float, nargs="+",
+                        default=(1.0, 2.0, 3.0), metavar="R",
+                        help="Increasing safe-path search radii in meters")
+    parser.add_argument("--min-visible-gain", type=float, default=2.0,
+                        help="Minimum visible frontier weight for an early goal")
     parser.add_argument("--verified-start-radius", type=float,
                         help="Optional externally verified grass disk around first pose")
+    parser.add_argument("--performance-log", type=Path,
+                        help="Write per-frame JSONL replay timings to this CSV")
+    parser.add_argument("--profile-only", action="store_true",
+                        help="Process JSONL frames and write timing CSV without opening a plot")
     args = parser.parse_args()
     if args.speed <= 0:
         parser.error("--speed must be positive")
@@ -759,16 +863,33 @@ def main() -> None:
         exploration_config = ExplorationConfig(
             robot_radius=args.exploration_robot_radius,
             sensor_range=args.exploration_sensor_range,
-            resolution=args.grid_resolution)
+            resolution=args.grid_resolution,
+            path_radii=args.goal_path_radii,
+            min_visible_gain=args.min_visible_gain)
     except ValueError as error:
         parser.error(str(error))
     if args.log.suffix.lower() == ".jsonl":
         if args.grass_csv:
             parser.error("--grass-csv is only supported for the text log replay")
+        if args.profile_only:
+            performance_log = args.performance_log or Path("exploration_performance.csv")
+            count, totals, maximum = profile_exploration_stream(
+                iter_data_package(args.log, args.max_records),
+                exploration_config, performance_log, args.verified_start_radius)
+            print(f"Profiled {count} visual frames; CSV: {performance_log}")
+            print("Total ms by stage: " + ", ".join(
+                f"{name}={totals[name]:.1f}" for name in
+                ("reader_ms", "raster_ms", "safe_ms", "closure_ms",
+                 "goal_ms", "update_ms")))
+            print(f"Maximum update: {maximum:.1f} ms")
+            return
         replay_exploration_stream(iter_data_package(args.log, args.max_records),
                                   args.speed, exploration_config,
-                                  args.verified_start_radius)
+                                  args.verified_start_radius,
+                                  performance_log=args.performance_log)
         return
+    if args.profile_only:
+        parser.error("--profile-only requires a JSONL log")
     frames = load_frames(args.log)
     if args.grass_csv:
         load_grass_csv(args.grass_csv, frames)
