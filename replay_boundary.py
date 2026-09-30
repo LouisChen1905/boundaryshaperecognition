@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
 import csv
 import json
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from itertools import chain
+from itertools import chain, islice
 from pathlib import Path
 import re
+import warnings
 from time import perf_counter_ns
 from typing import Optional
 
@@ -43,7 +45,11 @@ EXPLORATION_PERFORMANCE_FIELDS = [
     "observed_grass_cells", "observed_boundary_cells", "known_grass_cells",
     "mapped_boundary_cells", "safe_cells", "reachable_cells", "frontier_cells",
     "candidate_pairs", "sight_checks", "sight_cache_hits",
-    "goal_search_radius", "goal_visible_gain"]
+    "goal_search_radius", "goal_visible_gain", "boundary_frontier_cells",
+    "goal_boundary_gain", "goal_boundary_distance", "map_version",
+    "observation_fused", "removed_boundary_cells", "goal_action",
+    "goal_release_reason", "goal_visit_count", "pose_alignment",
+    "pose_before_timestamp", "pose_after_timestamp", "pose_gap_ms"]
 
 
 @dataclass
@@ -58,6 +64,9 @@ class Frame:
     grass_world_xy: Optional[np.ndarray] = None
     camera_boundary_xyz: Optional[np.ndarray] = None
     camera_grass_xyz: Optional[np.ndarray] = None
+    pose_alignment: str = "embedded"
+    pose_before_timestamp: Optional[float] = None
+    pose_after_timestamp: Optional[float] = None
 
 
 def rotation(roll: float, pitch: float, yaw: float) -> np.ndarray:
@@ -137,28 +146,167 @@ def load_frames(path: Path) -> list[Frame]:
     return frames
 
 
-def iter_data_package(path: Path, max_records: Optional[int] = None):
-    """Yield visual frames without retaining the JSONL file in memory.
+def _sample_timestamp(record):
+    """Both navigation topics use data.timestamp in milliseconds, never arrival time."""
+    try:
+        value = float(record.get("data", {}).get("timestamp"))
+    except (TypeError, ValueError):
+        return None
+    return value / 1000 if np.isfinite(value) and value > 0 else None
 
-    ``max_records`` limits input records, including nonvisual records. It is
-    useful when inspecting a large or still growing capture.
+
+def _interpolate_attitude(first, second, fraction):
+    """Shortest-arc quaternion SLERP for Rz(yaw) Ry(pitch) Rx(roll)."""
+    def quaternion(rpy):
+        cr, cp, cy = np.cos(np.asarray(rpy) / 2)
+        sr, sp, sy = np.sin(np.asarray(rpy) / 2)
+        return np.array([cr * cp * cy + sr * sp * sy,
+                         sr * cp * cy - cr * sp * sy,
+                         cr * sp * cy + sr * cp * sy,
+                         cr * cp * sy - sr * sp * cy])
+
+    q0, q1 = quaternion(first), quaternion(second)
+    dot = float(np.dot(q0, q1))
+    if dot < 0:
+        q1, dot = -q1, -dot
+    dot = np.clip(dot, -1., 1.)
+    if dot > .9995:
+        q = (1 - fraction) * q0 + fraction * q1
+    else:
+        angle = np.arccos(dot)
+        q = (np.sin((1 - fraction) * angle) * q0
+             + np.sin(fraction * angle) * q1) / np.sin(angle)
+    w, x, y, z = q / np.linalg.norm(q)
+    matrix = np.array([
+        [1 - 2 * (y*y + z*z), 2 * (x*y - w*z), 2 * (x*z + w*y)],
+        [2 * (x*y + w*z), 1 - 2 * (x*x + z*z), 2 * (y*z - w*x)],
+        [2 * (x*z - w*y), 2 * (y*z + w*x), 1 - 2 * (x*x + y*y)]])
+    pitch = np.arcsin(np.clip(-matrix[2, 0], -1., 1.))
+    if abs(np.cos(pitch)) > 1e-8:
+        roll = np.arctan2(matrix[2, 1], matrix[2, 2])
+        yaw = np.arctan2(matrix[1, 0], matrix[0, 0])
+    else:
+        roll = 0.
+        yaw = np.arctan2(-matrix[0, 1], matrix[1, 1])
+    return np.array([roll, pitch, yaw])
+
+
+def iter_data_package(path: Path, max_records: Optional[int] = None,
+                      pose_max_gap_s: float = 0.1, alignment_stats=None):
+    """Align clouds to location.data.timestamp with bounded pose/pending buffers.
+
+    Position is interpolated linearly and attitude by quaternion SLERP. Only
+    exact matches or bracketing samples within pose_max_gap_s are accepted.
+    No nearest/latest pose, extrapolation, or system_ms fallback is used.
+    max_records bounds lines actually read, including lookahead for a bracket.
     """
-    pose = None
+    if not np.isfinite(pose_max_gap_s) or pose_max_gap_s <= 0:
+        raise ValueError("pose_max_gap_s must be finite and positive")
+    if max_records is not None and max_records <= 0:
+        raise ValueError("max_records must be positive")
+    stats = alignment_stats if alignment_stats is not None else {}
+    names = ("location_packets", "visual_packets", "aligned_frames",
+             "exact_frames", "interpolated_frames", "skipped_invalid_timestamp",
+             "skipped_invalid_pose", "skipped_backwards_visual",
+             "skipped_pose_gap", "skipped_before_pose_history",
+             "skipped_no_future_pose", "skipped_pending_overflow")
+    stats.update({name: 0 for name in names})
+    pose_times, poses = [], []
+    pending = deque()
     previous_time = None
-    with path.open("r", encoding="utf-8-sig") as source:
-        for number, line in enumerate(source, 1):
-            if max_records is not None and number > max_records:
+    warned = set()
+
+    def skip(reason):
+        stats["skipped_" + reason] += 1
+        if reason not in warned:
+            warnings.warn("Skipping navigation packet: " + reason
+                          + " (alignment uses data.timestamp only)", RuntimeWarning)
+            warned.add(reason)
+
+    def ready_frames(final=False):
+        while pending:
+            timestamp, boundary, grass = pending[0]
+            index = bisect_left(pose_times, timestamp)
+            if index < len(pose_times) and pose_times[index] == timestamp:
+                xyz, rpy = poses[index]
+                before = after = timestamp
+                method = "exact"
+            elif 0 < index < len(pose_times):
+                before, after = pose_times[index - 1], pose_times[index]
+                if after - before > pose_max_gap_s + 1e-9:
+                    pending.popleft()
+                    skip("pose_gap")
+                    continue
+                fraction = (timestamp - before) / (after - before)
+                p0, a0 = poses[index - 1]
+                p1, a1 = poses[index]
+                xyz = p0 + fraction * (p1 - p0)
+                rpy = _interpolate_attitude(a0, a1, fraction)
+                method = "interpolated"
+            elif pose_times and index == 0:
+                pending.popleft()
+                skip("before_pose_history")
+                continue
+            elif final:
+                pending.popleft()
+                skip("no_future_pose")
+                continue
+            else:
                 break
+            pending.popleft()
+            robot_rotation = rotation(*rpy)
+            world = (boundary @ rotation(*CAMERA_RPY).T + CAMERA_TRANSLATION)
+            world = world @ robot_rotation.T + xyz
+            clock = datetime.fromtimestamp(timestamp).strftime("%H:%M:%S.%f")[:-3]
+            frame = Frame(clock, timestamp, xyz.copy(), rpy.copy(), rpy[2],
+                          boundary[:, (0, 2)], world,
+                          camera_boundary_xyz=boundary, camera_grass_xyz=grass,
+                          pose_alignment=method, pose_before_timestamp=before,
+                          pose_after_timestamp=after)
+            grass_world = (grass @ rotation(*CAMERA_RPY).T + CAMERA_TRANSLATION)
+            frame.grass_world_xy = (grass_world @ robot_rotation.T + xyz)[:, :2]
+            stats["aligned_frames"] += 1
+            stats[method + "_frames"] += 1
+            yield frame
+
+    with path.open("r", encoding="utf-8-sig") as source:
+        records = source if max_records is None else islice(source, max_records)
+        for number, line in enumerate(records, 1):
             try:
                 record = json.loads(line)
                 topic = record.get("topic")
+                if topic not in ("location", "visual_boundary_points"):
+                    continue
                 data = record.get("data", {})
+                stats["location_packets" if topic == "location" else "visual_packets"] += 1
+                timestamp = _sample_timestamp(record)
+                if timestamp is None:
+                    skip("invalid_timestamp")
+                    continue
                 if topic == "location":
                     position = data["poseOI"]["position"]
                     attitude = data["poseOI"]["attitude"]
-                    pose = (np.array([position["east"], position["north"], position["up"]], dtype=float),
-                            np.array([attitude["roll"], attitude["pitch"], attitude["head"]], dtype=float))
-                elif topic == "visual_boundary_points" and pose is not None:
+                    xyz = np.array([position["east"], position["north"], position["up"]], dtype=float)
+                    rpy = np.array([attitude["roll"], attitude["pitch"], attitude["head"]], dtype=float)
+                    if not np.isfinite(xyz).all() or not np.isfinite(rpy).all():
+                        skip("invalid_pose")
+                        continue
+                    index = bisect_left(pose_times, timestamp)
+                    if index < len(pose_times) and pose_times[index] == timestamp:
+                        poses[index] = (xyz, rpy)
+                    else:
+                        pose_times.insert(index, timestamp)
+                        poses.insert(index, (xyz, rpy))
+                    # About 40 seconds at 50 Hz; bounded even for huge logs.
+                    if len(pose_times) > 2048:
+                        del pose_times[0]
+                        del poses[0]
+                else:
+                    if previous_time is not None and timestamp < previous_time:
+                        skip("backwards_visual")
+                        continue
+                    previous_time = timestamp
+
                     def points(key, count_key):
                         count = int(data[count_key])
                         values = data[key]
@@ -169,25 +317,15 @@ def iter_data_package(path: Path, max_records: Optional[int] = None):
 
                     boundary = points("vBoundaryPoints", "boundary_num")
                     grass = points("vGrassPoints", "grass_num")
-                    xyz, rpy = pose
-                    world = (boundary @ rotation(*CAMERA_RPY).T + CAMERA_TRANSLATION)
-                    world = world @ rotation(*rpy).T + xyz
-                    raw_time = float(data.get("timestamp") or record["system_ms"])
-                    timestamp = raw_time / 1000
-                    if previous_time is not None and timestamp < previous_time:
-                        timestamp = previous_time
-                    previous_time = timestamp
-                    clock = datetime.fromtimestamp(timestamp).strftime("%H:%M:%S.%f")[:-3]
-                    frame = Frame(clock, timestamp, xyz.copy(), rpy.copy(), rpy[2],
-                                  boundary[:, (0, 2)], world)
-                    frame.camera_boundary_xyz = boundary
-                    frame.camera_grass_xyz = grass
-                    grass_world = (grass @ rotation(*CAMERA_RPY).T + CAMERA_TRANSLATION)
-                    grass_world = grass_world @ rotation(*rpy).T + xyz
-                    frame.grass_world_xy = grass_world[:, :2]
-                    yield frame
+                    if len(pending) >= 128:
+                        pending.popleft()
+                        skip("pending_overflow")
+                    pending.append((timestamp, boundary, grass))
+                yield from ready_frames()
             except (ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
                 raise ValueError(f"Line {number}: invalid navigation data: {error}") from error
+        # At EOF or the record limit, never consume extra records or extrapolate.
+        yield from ready_frames(final=True)
 
 
 def load_data_package(path: Path) -> list[Frame]:
@@ -297,6 +435,14 @@ def reference_route_direction(frames: list[Frame], shapes):
 def update_exploration(explorer: BoundaryExplorer, frame: Frame,
                        performance=None):
     """Advance the map exactly once for a new frame."""
+    if performance is not None:
+        performance["pose_alignment"] = frame.pose_alignment
+        performance["pose_before_timestamp"] = frame.pose_before_timestamp
+        performance["pose_after_timestamp"] = frame.pose_after_timestamp
+        performance["pose_gap_ms"] = (
+            (frame.pose_after_timestamp - frame.pose_before_timestamp) * 1000
+            if frame.pose_before_timestamp is not None and frame.pose_after_timestamp is not None
+            else "")
     pose = (frame.robot_xyz[0], frame.robot_xyz[1], frame.robot_yaw + np.pi / 2)
     if frame.camera_boundary_xyz is not None:
         return explorer.update(frame.camera_grass_xyz, frame.camera_boundary_xyz,
@@ -827,6 +973,8 @@ def main() -> None:
                         help="Distance in meters used to count grass coverage near reference")
     parser.add_argument("--max-records", type=int,
                         help="Read at most this many JSONL input records")
+    parser.add_argument("--pose-max-gap-ms", type=float, default=100.0,
+                        help="Maximum location bracket interval for timestamp interpolation (ms)")
     parser.add_argument("--exploration-robot-radius", type=float, default=0.2,
                         help="Exploration footprint radius in meters (demo default: 0.2)")
     parser.add_argument("--exploration-sensor-range", type=float, default=2.0,
@@ -838,6 +986,24 @@ def main() -> None:
                         help="Increasing safe-path search radii in meters")
     parser.add_argument("--min-visible-gain", type=float, default=2.0,
                         help="Minimum visible frontier weight for an early goal")
+    parser.add_argument("--boundary-frontier-distance", type=float, default=0.3,
+                        help="Distance to observed boundary for priority frontiers (meters)")
+    parser.add_argument("--boundary-distance-weight", type=float, default=2.0,
+                        help="Viewpoint boundary-distance penalty per meter")
+    parser.add_argument("--goal-reached-distance", type=float, default=0.15,
+                        help="Distance in meters that marks an assigned goal reached")
+    parser.add_argument("--goal-progress-timeout-s", type=float, default=15.0,
+                        help="Release a goal after this many seconds without progress")
+    parser.add_argument("--goal-progress-distance", type=float, default=0.1,
+                        help="Cumulative distance improvement in meters that resets timeout")
+    parser.add_argument("--goal-refresh-interval-s", type=float, default=2.0,
+                        help="Re-score all candidate views at least this often (sensor seconds)")
+    parser.add_argument("--goal-refresh-distance", type=float, default=0.3,
+                        help="Robot displacement since last selection that refreshes the goal (m)")
+    parser.add_argument("--goal-refresh-yaw-deg", type=float, default=20.0,
+                        help="Wrapped heading change since last selection that refreshes the goal")
+    parser.add_argument("--boundary-clear-observations", type=int, default=3,
+                        help="Grass-only observations required to retract a boundary cell")
     parser.add_argument("--verified-start-radius", type=float,
                         help="Optional externally verified grass disk around first pose")
     parser.add_argument("--performance-log", type=Path,
@@ -857,6 +1023,8 @@ def main() -> None:
         parser.error("--grass-support-radius must be positive")
     if args.max_records is not None and args.max_records <= 0:
         parser.error("--max-records must be positive")
+    if not np.isfinite(args.pose_max_gap_ms) or args.pose_max_gap_ms <= 0:
+        parser.error("--pose-max-gap-ms must be finite and positive")
     if args.verified_start_radius is not None and args.verified_start_radius <= 0:
         parser.error("--verified-start-radius must be positive")
     try:
@@ -865,16 +1033,29 @@ def main() -> None:
             sensor_range=args.exploration_sensor_range,
             resolution=args.grid_resolution,
             path_radii=args.goal_path_radii,
-            min_visible_gain=args.min_visible_gain)
+            min_visible_gain=args.min_visible_gain,
+            boundary_frontier_distance=args.boundary_frontier_distance,
+            boundary_distance_weight=args.boundary_distance_weight,
+            goal_reached_distance=args.goal_reached_distance,
+            goal_progress_timeout_s=args.goal_progress_timeout_s,
+            goal_progress_distance=args.goal_progress_distance,
+            goal_refresh_interval_s=args.goal_refresh_interval_s,
+            goal_refresh_distance=args.goal_refresh_distance,
+            goal_refresh_yaw_deg=args.goal_refresh_yaw_deg,
+            boundary_clear_observations=args.boundary_clear_observations)
     except ValueError as error:
         parser.error(str(error))
     if args.log.suffix.lower() == ".jsonl":
         if args.grass_csv:
             parser.error("--grass-csv is only supported for the text log replay")
+        alignment_stats = {}
+        frames = iter_data_package(args.log, args.max_records,
+                                   pose_max_gap_s=args.pose_max_gap_ms / 1000,
+                                   alignment_stats=alignment_stats)
         if args.profile_only:
             performance_log = args.performance_log or Path("exploration_performance.csv")
             count, totals, maximum = profile_exploration_stream(
-                iter_data_package(args.log, args.max_records),
+                frames,
                 exploration_config, performance_log, args.verified_start_radius)
             print(f"Profiled {count} visual frames; CSV: {performance_log}")
             print("Total ms by stage: " + ", ".join(
@@ -882,8 +1063,9 @@ def main() -> None:
                 ("reader_ms", "raster_ms", "safe_ms", "closure_ms",
                  "goal_ms", "update_ms")))
             print(f"Maximum update: {maximum:.1f} ms")
+            print("Pose alignment: " + str(alignment_stats))
             return
-        replay_exploration_stream(iter_data_package(args.log, args.max_records),
+        replay_exploration_stream(frames,
                                   args.speed, exploration_config,
                                   args.verified_start_radius,
                                   performance_log=args.performance_log)

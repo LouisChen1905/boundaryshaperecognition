@@ -28,15 +28,41 @@ class ExplorationConfig:
     sensor_fov_deg: float = 120.0
     path_radii: tuple = (1.0, 2.0, 3.0)
     min_visible_gain: float = 2.0
+    boundary_frontier_distance: float = 0.3
+    boundary_distance_weight: float = 2.0
+    goal_reached_distance: float = 0.15
+    goal_progress_timeout_s: float = 15.0
+    goal_progress_distance: float = 0.1
+    boundary_clear_observations: int = 3
+    goal_refresh_interval_s: float = 2.0
+    goal_refresh_distance: float = 0.3
+    goal_refresh_yaw_deg: float = 20.0
 
     def __post_init__(self):
+        positive = (self.robot_radius, self.sensor_range, self.resolution,
+                    self.boundary_link_gap, self.goal_reached_distance,
+                    self.goal_progress_timeout_s, self.goal_progress_distance,
+                    self.goal_refresh_interval_s, self.goal_refresh_distance,
+                    self.goal_refresh_yaw_deg)
+        nonnegative = (self.boundary_clearance, self.pose_margin, self.goal_spacing)
+        if (any(not math.isfinite(v) or v <= 0 for v in positive)
+                or any(not math.isfinite(v) or v < 0 for v in nonnegative)
+                or any(isinstance(v, bool) or not isinstance(v, (int, np.integer))
+                       or v < 1 for v in (self.grass_observations,
+                                          self.boundary_clear_observations))):
+            raise ValueError("exploration limits must be finite; counts must be positive integers")
         if (self.robot_radius <= 0 or self.sensor_range <= 0 or self.resolution <= 0
                 or self.boundary_clearance < 0 or self.pose_margin < 0
                 or self.grass_observations < 1 or self.boundary_link_gap <= 0
                 or self.goal_spacing < 0
                 or not 0 < self.sensor_fov_deg <= 360
+                or self.goal_refresh_yaw_deg > 180
                 or not math.isfinite(self.min_visible_gain)
-                or self.min_visible_gain <= 0):
+                or self.min_visible_gain <= 0
+                or not math.isfinite(self.boundary_frontier_distance)
+                or self.boundary_frontier_distance <= 0
+                or not math.isfinite(self.boundary_distance_weight)
+                or self.boundary_distance_weight < 0):
             raise ValueError("exploration configuration contains an invalid limit")
         try:
             radii = tuple(self.path_radii)
@@ -105,6 +131,16 @@ class BoundaryExplorer:
         self.last_goal = None
         self.goal_visits = {}
         self._visibility_cache = {}
+        self._offset_cache = {}
+        self._grass_counterevidence = {}
+        self.map_version = 0
+        self._map_signature = (frozenset(), frozenset())
+        self.active_goal = None
+        self._excluded_goals = set()
+        self._goal_progress_time = None
+        self._goal_progress_distance = None
+        self._goal_refresh_time = None
+        self._goal_refresh_pose = None
 
     def cell(self, xy):
         x, y = np.asarray(xy, dtype=float)[:2]
@@ -160,19 +196,27 @@ class BoundaryExplorer:
         return cells
 
     def _disk_offsets(self, radius):
-        # Include any cell whose square could touch the robot's disk.
-        reach = radius + self.config.resolution / math.sqrt(2)
-        cells = int(math.ceil(reach / self.config.resolution))
-        return [(dx, dy) for dx in range(-cells, cells + 1)
+        # Minimum square-to-square distance: every center in the source cell
+        # must have its entire disk clear. Touching an unknown square is unsafe.
+        if radius not in self._offset_cache:
+            resolution = self.config.resolution
+            cells = int(math.ceil(radius / resolution)) + 1
+            offsets = tuple(
+                (dx, dy) for dx in range(-cells, cells + 1)
                 for dy in range(-cells, cells + 1)
-                if math.hypot(dx, dy) * self.config.resolution <= reach]
+                if math.hypot(max(abs(dx) - 1, 0), max(abs(dy) - 1, 0))
+                * resolution <= radius + 1e-12)
+            if len(self._offset_cache) >= 128:
+                self._offset_cache.pop(next(iter(self._offset_cache)))
+            self._offset_cache[radius] = offsets
+        return self._offset_cache[radius]
 
-    def _safe_cells(self, position_std):
+    def _safe_cells(self, position_std, extra_margin=0.0):
         known = {cell for cell, hits in self.grass_hits.items()
                  if hits >= self.config.grass_observations and cell not in self.boundary_hits}
         boundary = set(self.boundary_hits)
         footprint = self.config.robot_radius + max(self.config.pose_margin,
-                                                   2 * position_std)
+                                                   2 * position_std) + extra_margin
         body_offsets = self._disk_offsets(footprint)
         boundary_offsets = self._disk_offsets(footprint + self.config.boundary_clearance)
         safe = set()
@@ -183,6 +227,56 @@ class BoundaryExplorer:
                 continue
             safe.add((x, y))
         return known, boundary, safe
+
+    def _segment_cells(self, start, end):
+        """Supercover of a closed segment, including edge and corner contacts.
+
+        Grid crossings partition the segment into intervals contained in one
+        cell (or on an edge). Check crossings and interval midpoints, so no
+        short intersection can fall between fixed-distance samples.
+        """
+        a = np.asarray(start, dtype=float)[:2] / self.config.resolution
+        b = np.asarray(end, dtype=float)[:2] / self.config.resolution
+        delta = b - a
+        times = {0.0, 1.0}
+        for axis in (0, 1):
+            if delta[axis] == 0:
+                continue
+            low, high = sorted((a[axis], b[axis]))
+            for gridline in range(math.ceil(low), math.floor(high) + 1):
+                t = (gridline - a[axis]) / delta[axis]
+                if 0 <= t <= 1:
+                    times.add(float(t))
+        ordered = sorted(times)
+        samples = ordered + [(x + y) / 2 for x, y in zip(ordered, ordered[1:])]
+        cells = set()
+        for t in samples:
+            point = a + t * delta
+            axes = []
+            for value in point:
+                nearest = round(float(value))
+                axes.append((nearest - 1, nearest) if abs(value - nearest) <= 1e-10
+                            else (math.floor(value),))
+            cells.update((x, y) for x in axes[0] for y in axes[1])
+        return cells
+
+    def _path_is_safe(self, points, safe):
+        if not len(points):
+            return False
+        if len(points) == 1:
+            return self._segment_cells(points[0], points[0]) <= safe
+        return all(self._segment_cells(a, b) <= safe
+                   for a, b in zip(points[:-1], points[1:]))
+
+    def _build_path(self, pose, target, start, previous):
+        cells = [target]
+        while cells[-1] != start:
+            cells.append(previous[cells[-1]])
+        cells.reverse()
+        centers = np.array([self.center(cell) for cell in cells])
+        if np.array_equal(np.asarray(pose[:2]), centers[0]):
+            return centers
+        return np.vstack((pose[:2], centers))
 
     @staticmethod
     def _neighbors(cell, allowed):
@@ -241,10 +335,41 @@ class BoundaryExplorer:
                 return False
         return True
 
-    def _goal(self, pose, known, boundary, safe, performance=None):
+    def _view_heading(self, point, visible):
+        """Maximize boundary-frontier count, then total gain in one angular window."""
+        angles = sorted((math.atan2(target[1] - point[1], target[0] - point[0]),
+                         weight) for target, weight in visible)
+        width = math.radians(self.config.sensor_fov_deg)
+        count = len(angles)
+        angles += [(angle + 2 * math.pi, weight) for angle, weight in angles]
+        end = 0
+        gain = boundary_gain = 0.0
+        best = None
+        for start in range(count):
+            while (end < start + count
+                   and angles[end][0] - angles[start][0] <= width + 1e-12):
+                weight = angles[end][1]
+                gain += weight
+                boundary_gain += weight if weight == 2.0 else 0.0
+                end += 1
+            heading = (angles[start][0] + angles[end - 1][0]) / 2
+            rank = (boundary_gain, gain)
+            if best is None or rank > best[:2]:
+                best = (boundary_gain, gain, math.atan2(math.sin(heading),
+                                                       math.cos(heading)))
+            weight = angles[start][1]
+            gain -= weight
+            boundary_gain -= weight if weight == 2.0 else 0.0
+        return best[2], best[1], best[0]
+
+    def _goal(self, pose, known, boundary, safe, performance=None, preferred_goal=None):
         started = perf_counter_ns()
+        if performance is not None:
+            performance["boundary_frontier_cells"] = 0
+            performance["goal_boundary_gain"] = 0.0
+            performance["goal_boundary_distance"] = ""
         start = self.cell(pose[:2])
-        if start not in safe:
+        if not self._path_is_safe([pose[:2]], safe):
             if performance is not None:
                 performance["goal_reach_ms"] = 0.0
                 performance["goal_frontier_ms"] = 0.0
@@ -279,7 +404,7 @@ class BoundaryExplorer:
             return None, np.empty((0, 2)), "no grass-to-unknown frontier"
         sensor_range = self.config.sensor_range
         goal_spacing = self.config.goal_spacing
-        bucket_width = sensor_range
+        bucket_width = max(sensor_range, self.config.boundary_frontier_distance)
         frontier_buckets = {}
         boundary_buckets = {}
         for cell in boundary:
@@ -287,33 +412,44 @@ class BoundaryExplorer:
             bucket = (math.floor(point[0] / bucket_width),
                       math.floor(point[1] / bucket_width))
             boundary_buckets.setdefault(bucket, []).append(point)
-        for cell in frontiers:
+        boundary_frontier_count = 0
+        for cell in sorted(frontiers):
             point = tuple(self.center(cell))
             bucket = (math.floor(point[0] / bucket_width),
                       math.floor(point[1] / bucket_width))
             near_boundary = any(
-                math.hypot(point[0] - b[0], point[1] - b[1]) <= sensor_range
+                math.hypot(point[0] - b[0], point[1] - b[1])
+                <= self.config.boundary_frontier_distance + 1e-12
                 for dx in (-1, 0, 1) for dy in (-1, 0, 1)
                 for b in boundary_buckets.get((bucket[0] + dx,
                                                bucket[1] + dy), ()))
             frontier_buckets.setdefault(bucket, []).append(
                 (cell, point, 2.0 if near_boundary else 1.0))
+            boundary_frontier_count += int(near_boundary)
         if performance is not None:
+            performance["boundary_frontier_cells"] = boundary_frontier_count
             performance["goal_frontier_ms"] = (perf_counter_ns() - started) / 1e6
         started = perf_counter_ns()
         best = None
         best_gain = 0.0
+        best_boundary_gain = 0.0
+        best_distance = ""
         selected_radius = "full"
         candidate_pairs = 0
         sight_checks = 0
         cache_hits = 0
         scored_ns = 0
+        geometric_view = False
+        preferred_cell = self.cell(preferred_goal[:2]) if preferred_goal is not None else None
 
         def score_cell(cell, path_cost):
             nonlocal candidate_pairs, sight_checks, cache_hits
             point = tuple(self.center(cell))
-            if math.hypot(point[0] - pose[0], point[1] - pose[1]) < goal_spacing:
-                return None
+            if preferred_goal is None:
+                distance_from_pose = math.hypot(point[0] - pose[0], point[1] - pose[1])
+                if (distance_from_pose < goal_spacing
+                        or distance_from_pose <= self.config.goal_reached_distance):
+                    return None
             visible = []
             bucket_x = math.floor(point[0] / bucket_width)
             bucket_y = math.floor(point[1] / bucket_width)
@@ -338,19 +474,35 @@ class BoundaryExplorer:
                     visible.append((target, weight))
             if not visible:
                 return None
-            heading_target = max(visible, key=lambda item: item[1])[0]
-            heading = math.atan2(heading_target[1] - point[1],
-                                 heading_target[0] - point[0])
-            half_fov = math.radians(self.config.sensor_fov_deg) / 2
-            gain = sum(weight for target, weight in visible
-                       if _bearing_difference(math.atan2(target[1] - point[1],
-                                                         target[0] - point[0]), heading)
-                       <= half_fov)
-            score = gain / (1 + path_cost) - 2 * self.goal_visits.get(cell, 0)
-            return (score, -path_cost, cell, heading), gain
+            if preferred_goal is None:
+                heading, gain, boundary_gain = self._view_heading(point, visible)
+            else:
+                heading = preferred_goal[2]
+                weights = [weight for target, weight in visible
+                           if _bearing_difference(math.atan2(target[1] - point[1],
+                                                              target[0] - point[0]), heading)
+                           <= math.radians(self.config.sensor_fov_deg) / 2 + 1e-12]
+                gain = sum(weights)
+                boundary_gain = sum(weight for weight in weights if weight == 2.0)
+                if not gain:
+                    return None
+            # Distances beyond sensor range share the same capped penalty.
+            distance = min((math.hypot(point[0] - b[0], point[1] - b[1])
+                            for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                            for b in boundary_buckets.get((bucket_x + dx,
+                                                           bucket_y + dy), ())),
+                           default=sensor_range)
+            distance = min(distance, sensor_range) if boundary else 0.0
+            effective_gain = boundary_gain if boundary_gain else gain
+            score = (effective_gain / (1 + path_cost
+                     + self.config.boundary_distance_weight * distance)
+                     - 2 * self.goal_visits.get(cell, 0))
+            return ((boundary_gain > 0, score, -path_cost, cell, heading),
+                    gain, boundary_gain, distance)
 
         pending = None
-        for radius in (*self.config.path_radii, float("inf")):
+        radii = (float("inf"),) if preferred_goal is not None else (*self.config.path_radii, float("inf"))
+        for radius in radii:
             stage_best = None
             stage_gain = 0.0
             while True:
@@ -365,23 +517,45 @@ class BoundaryExplorer:
                     break
                 pending = None
                 reachable_cells += 1
+                if preferred_goal is not None and cell != preferred_cell:
+                    continue
                 tick = perf_counter_ns()
                 candidate = score_cell(cell, path_cost)
                 scored_ns += perf_counter_ns() - tick
                 if candidate is None:
+                    if preferred_goal is not None:
+                        break
                     continue
-                rank, gain = candidate
-                if best is None or rank[:3] > best[:3]:
+                rank, gain, boundary_gain, distance = candidate
+                geometric_view = True
+                if rank[1] <= 0 or cell in self._excluded_goals:
+                    if preferred_goal is not None:
+                        break
+                    continue
+                if best is None or rank[:4] > best[:4]:
                     best = rank
                     best_gain = gain
-                if (gain >= self.config.min_visible_gain and rank[0] > 0
-                        and (stage_best is None or rank[:3] > stage_best[:3])):
+                    best_boundary_gain = boundary_gain
+                    best_distance = distance if boundary else ""
+                # A local generic frontier must not hide a boundary frontier
+                # reachable at a later radius. Exhaustion still permits fallback.
+                qualifying_gain = boundary_gain if boundary_frontier_count else gain
+                if (qualifying_gain >= self.config.min_visible_gain and rank[1] > 0
+                        and (stage_best is None or rank[:4] > stage_best[:4])):
                     stage_best = rank
                     stage_gain = gain
+                    stage_boundary_gain = boundary_gain
+                    stage_distance = distance
+                if preferred_goal is not None:
+                    selected_radius = "held"
+                    break
             if stage_best is not None:
                 best = stage_best
                 best_gain = stage_gain
-                selected_radius = radius if math.isfinite(radius) else "full"
+                best_boundary_gain = stage_boundary_gain
+                best_distance = stage_distance if boundary else ""
+                selected_radius = ("held" if preferred_goal is not None else
+                                   radius if math.isfinite(radius) else "full")
                 break
             if pending is None:
                 break
@@ -394,15 +568,17 @@ class BoundaryExplorer:
             performance["sight_cache_hits"] = cache_hits
             performance["goal_search_radius"] = selected_radius
             performance["goal_visible_gain"] = best_gain
+            performance["goal_boundary_gain"] = best_boundary_gain
+            performance["goal_boundary_distance"] = best_distance
         if best is None:
-            return None, np.empty((0, 2)), "no reachable safe viewing pose"
-        _, _, target_cell, heading = best
+            reason = ("reachable views exhausted in current map version" if geometric_view
+                      else "no reachable safe viewing pose")
+            return None, np.empty((0, 2)), reason
+        _, _, _, target_cell, heading = best
         target = self.center(target_cell)
-        cells = [target_cell]
-        while cells[-1] != start:
-            cells.append(previous[cells[-1]])
-        cells.reverse()
-        path = np.array([self.center(cell) for cell in cells])
+        path = self._build_path(pose, target_cell, start, previous)
+        if not self._path_is_safe(path, safe):
+            return None, np.empty((0, 2)), "unsafe path from robot pose"
         return (float(target[0]), float(target[1]), heading), path, "safe frontier viewpoint"
 
     def _boundary_closed(self, robot_cell):
@@ -429,16 +605,161 @@ class BoundaryExplorer:
                     queue.append(neighbor)
         return True
 
+    def _fuse_observation(self, grass_cells, boundary_cells, timestamp):
+        # Preserve the original diagnostics: newly stored evidence cells, not
+        # newly confirmed grass. Classification progress is tracked separately.
+        new_grass = len(grass_cells - boundary_cells - self.grass_hits.keys()
+                        - self._grass_counterevidence.keys())
+        new_boundary = len(boundary_cells - self.boundary_hits.keys())
+        removed_boundary = 0
+        for cell in boundary_cells:
+            self.grass_hits.pop(cell, None)
+            self._grass_counterevidence.pop(cell, None)
+            self.boundary_hits[cell] = min(255, self.boundary_hits.get(cell, 0) + 1)
+            self.last_seen[cell] = timestamp
+        for cell in grass_cells - boundary_cells:
+            self.last_seen[cell] = timestamp
+            if cell in self.boundary_hits:
+                count = self._grass_counterevidence.get(cell, 0) + 1
+                self._grass_counterevidence[cell] = count
+                if count < self.config.boundary_clear_observations:
+                    continue
+                del self.boundary_hits[cell]
+                del self._grass_counterevidence[cell]
+                self.grass_hits[cell] = count
+                removed_boundary += 1
+            else:
+                self.grass_hits[cell] = min(max(255, self.config.grass_observations),
+                                           self.grass_hits.get(cell, 0) + 1)
+        if new_boundary or removed_boundary:
+            self._visibility_cache.clear()
+        return new_grass, new_boundary, removed_boundary
+
+    def _release_goal(self):
+        self.active_goal = None
+        self.last_goal = None
+        self._goal_progress_time = None
+        self._goal_progress_distance = None
+        self._goal_refresh_time = None
+        self._goal_refresh_pose = None
+
+    def _goal_refresh_reason(self, pose, timestamp):
+        if self._goal_refresh_time is None or self._goal_refresh_pose is None:
+            return "refresh_initial"
+        if timestamp - self._goal_refresh_time >= self.config.goal_refresh_interval_s:
+            return "refresh_interval"
+        if math.hypot(pose[0] - self._goal_refresh_pose[0],
+                      pose[1] - self._goal_refresh_pose[1]) >= self.config.goal_refresh_distance:
+            return "refresh_distance"
+        if (_bearing_difference(pose[2], self._goal_refresh_pose[2])
+                >= math.radians(self.config.goal_refresh_yaw_deg)):
+            return "refresh_yaw"
+        return ""
+
+    def _exploration_decision(self, pose, timestamp, known, boundary, safe,
+                              closed, map_changed, performance):
+        release_reason = ""
+        action = "none"
+        refresh_previous = None
+        if self.active_goal is not None:
+            cell = self.cell(self.active_goal[:2])
+            distance = math.hypot(self.active_goal[0] - pose[0],
+                                  self.active_goal[1] - pose[1])
+            if distance <= self.config.goal_reached_distance:
+                self.goal_visits[cell] = self.goal_visits.get(cell, 0) + 1
+                release_reason = "arrived"
+                self._release_goal()
+            elif (map_changed or self._goal_progress_time is None
+                  or self._goal_progress_distance - distance
+                  >= self.config.goal_progress_distance):
+                self._goal_progress_time = timestamp
+                self._goal_progress_distance = distance
+            elif timestamp - self._goal_progress_time >= self.config.goal_progress_timeout_s:
+                self._excluded_goals.add(cell)
+                release_reason = "progress_timeout"
+                self._release_goal()
+
+        if self.active_goal is not None:
+            refresh_reason = self._goal_refresh_reason(pose, timestamp)
+            if refresh_reason:
+                # Reselecting the same cell must not postpone timeout forever.
+                refresh_previous = (self.last_goal, self._goal_progress_time,
+                                    self._goal_progress_distance)
+                release_reason = refresh_reason
+                self._release_goal()
+
+        if closed:
+            if self.active_goal is not None:
+                release_reason = "boundary_closed"
+            self._release_goal()
+            status, reason, goal, path = ("complete",
+                "confirmed boundary encloses robot on grid", None, np.empty((0, 2)))
+        elif not self._path_is_safe([pose[:2]], safe):
+            if self.active_goal is not None:
+                release_reason = "robot_unsafe"
+            self._release_goal()
+            status, reason, goal, path = ("waiting_for_observation",
+                "robot footprint lacks confirmed grass", None, np.empty((0, 2)))
+        else:
+            goal = None
+            held_performance = {} if performance is not None else None
+            if self.active_goal is not None:
+                goal, path, reason = self._goal(pose, known, boundary, safe,
+                    held_performance, preferred_goal=self.active_goal)
+                if goal is not None:
+                    action = "held"
+                    reason = "holding safe frontier viewpoint"
+                    if performance is not None:
+                        performance.update(held_performance)
+                else:
+                    release_reason = "goal_invalid: " + reason
+                    self._release_goal()
+            if goal is None:
+                goal, path, reason = self._goal(pose, known, boundary, safe, performance)
+                if performance is not None and held_performance:
+                    for key in ("goal_reach_ms", "goal_frontier_ms", "goal_score_ms",
+                                "candidate_pairs", "sight_checks", "sight_cache_hits"):
+                        performance[key] += held_performance.get(key, 0)
+                if goal is not None:
+                    self.active_goal = goal
+                    self.last_goal = self.cell(goal[:2])
+                    self._goal_progress_time = timestamp
+                    self._goal_progress_distance = math.hypot(goal[0] - pose[0], goal[1] - pose[1])
+                    if refresh_previous is not None and self.last_goal == refresh_previous[0]:
+                        self._goal_progress_time = refresh_previous[1]
+                        self._goal_progress_distance = refresh_previous[2]
+                    self._goal_refresh_time = timestamp
+                    self._goal_refresh_pose = tuple(pose)
+                    action = "selected"
+            status = ("exploring" if goal is not None else
+                      "stalled" if reason == "reachable views exhausted in current map version"
+                      else "incomplete_unreachable")
+        if performance is not None:
+            performance["goal_action"] = action
+            performance["goal_release_reason"] = release_reason
+            performance["goal_visit_count"] = (self.goal_visits.get(self.last_goal, 0)
+                                                if self.last_goal is not None else 0)
+        return status, reason, goal, path
+
     def update(self, grass_points, boundary_points, robot_pose, timestamp,
                sensor_to_world=None, position_std=0.0, performance=None):
         """Fuse one observation and return the next safe exploration decision.
 
         ``robot_pose`` is global (x, y, yaw). Point arrays are either global
         XY or sensor XYZ with ``sensor_to_world``. Each cell receives at most
-        one evidence hit from a frame, regardless of point density.
+        one evidence hit from a frame, regardless of point density. Equal
+        timestamps re-evaluate the pose but do not fuse evidence again;
+        backwards timestamps are rejected. Classification changes reset visit
+        penalties, and stalled means reachable views have been exhausted.
         """
         started = perf_counter_ns()
         stage = started
+        if performance is not None:
+            performance.update({name: 0 for name in (
+                "goal_reach_ms", "goal_frontier_ms", "goal_score_ms", "reachable_cells",
+                "frontier_cells", "candidate_pairs", "sight_checks", "sight_cache_hits",
+                "goal_visible_gain", "boundary_frontier_cells", "goal_boundary_gain")})
+            performance.update(goal_search_radius="", goal_boundary_distance="")
         pose = np.asarray(robot_pose, dtype=float)
         if pose.shape != (3,) or not np.isfinite(pose).all():
             raise ValueError("robot_pose must be finite (x, y, yaw)")
@@ -453,7 +774,7 @@ class BoundaryExplorer:
             performance["grass_points"] = len(grass)
             performance["boundary_points"] = len(observed_boundary)
         stage = perf_counter_ns()
-        self.last_timestamp = float(timestamp)
+        observation_fused = self.last_timestamp is None or timestamp > self.last_timestamp
         grass_cells = {self.cell(point) for point in grass}
         boundary_cells = self._boundary_observation_cells(observed_boundary)
         if performance is not None:
@@ -461,48 +782,37 @@ class BoundaryExplorer:
             performance["observed_grass_cells"] = len(grass_cells)
             performance["observed_boundary_cells"] = len(boundary_cells)
         stage = perf_counter_ns()
-        new_grass = len(grass_cells - self.grass_hits.keys())
-        new_boundary = len(boundary_cells - self.boundary_hits.keys())
-        if new_boundary:
-            self._visibility_cache.clear()
-        for cell in grass_cells:
-            self.grass_hits[cell] = min(255, self.grass_hits.get(cell, 0) + 1)
-            self.last_seen[cell] = timestamp
-        for cell in boundary_cells:
-            self.boundary_hits[cell] = min(255, self.boundary_hits.get(cell, 0) + 1)
-            self.last_seen[cell] = timestamp
+        new_grass = new_boundary = removed_boundary = 0
+        if observation_fused:
+            new_grass, new_boundary, removed_boundary = self._fuse_observation(
+                grass_cells, boundary_cells, timestamp)
+            self.last_timestamp = float(timestamp)
         if performance is not None:
             performance["evidence_ms"] = (perf_counter_ns() - stage) / 1e6
         stage = perf_counter_ns()
         known, boundary, safe = self._safe_cells(position_std)
+        signature = (frozenset(known), frozenset(boundary))
+        map_changed = signature != self._map_signature
+        if map_changed:
+            self.map_version += 1
+            self._map_signature = signature
+            self.goal_visits.clear()
+            self._excluded_goals.clear()
         if performance is not None:
             performance["safe_ms"] = (perf_counter_ns() - stage) / 1e6
             performance["known_grass_cells"] = len(known)
             performance["mapped_boundary_cells"] = len(boundary)
             performance["safe_cells"] = len(safe)
+            performance["map_version"] = self.map_version
+            performance["observation_fused"] = int(observation_fused)
+            performance["removed_boundary_cells"] = removed_boundary
         stage = perf_counter_ns()
         closed = self._boundary_closed(self.cell(pose[:2]))
         if performance is not None:
             performance["closure_ms"] = (perf_counter_ns() - stage) / 1e6
         stage = perf_counter_ns()
-        if closed:
-            status, reason, goal, path = ("complete", "confirmed closed contour",
-                                          None, np.empty((0, 2)))
-        else:
-            goal, path, reason = self._goal(pose, known, boundary, safe,
-                                           performance)
-            if goal is not None:
-                status = "exploring"
-                cell = self.cell(goal[:2])
-                if (self.last_goal == cell and not (new_grass or new_boundary)
-                        and np.linalg.norm(np.asarray(goal[:2]) - pose[:2])
-                        <= self.config.goal_spacing):
-                    self.goal_visits[cell] = self.goal_visits.get(cell, 0) + 1
-                self.last_goal = cell
-            elif self.cell(pose[:2]) not in safe:
-                status = "waiting_for_observation"
-            else:
-                status = "incomplete_unreachable"
+        status, reason, goal, path = self._exploration_decision(
+            pose, timestamp, known, boundary, safe, closed, map_changed, performance)
         if performance is not None:
             performance["goal_ms"] = (perf_counter_ns() - stage) / 1e6
         stage = perf_counter_ns()
@@ -516,11 +826,10 @@ class BoundaryExplorer:
         return result
 
     def trajectory_is_safe(self, poses_xytheta, position_std=0.0):
-        """Check a local planner's sampled swept path, including interpolation.
+        """Check every touched grid cell of a piecewise-linear center path.
 
-        The caller must sample its dynamic model densely enough between poses;
-        this function additionally interpolates each center segment at half a
-        grid cell. A false result means the command must not be executed.
+        Curved motion between poses is the caller's responsibility; use
+        command_is_safe for the unicycle arc model and its deviation bound.
         """
         poses = np.asarray(poses_xytheta, dtype=float)
         if poses.ndim != 2 or poses.shape[1] != 3 or not np.isfinite(poses).all():
@@ -528,15 +837,7 @@ class BoundaryExplorer:
         if not np.isfinite(position_std) or position_std < 0:
             raise ValueError("position_std must be finite and nonnegative")
         _, _, safe = self._safe_cells(position_std)
-        if not len(poses):
-            return False
-        for a, b in zip(poses[:-1], poses[1:]):
-            distance = np.linalg.norm(b[:2] - a[:2])
-            steps = max(1, int(math.ceil(distance / (self.config.resolution / 2))))
-            if any(self.cell(a[:2] + (b[:2] - a[:2]) * (i / steps)) not in safe
-                   for i in range(steps + 1)):
-                return False
-        return self.cell(poses[0, :2]) in safe and self.cell(poses[-1, :2]) in safe
+        return self._path_is_safe(poses[:, :2], safe)
 
     def command_is_safe(self, pose_xytheta, v, omega, horizon_s,
                         step_s=0.05, position_std=0.0):
@@ -545,22 +846,26 @@ class BoundaryExplorer:
         if (pose.shape != (3,) or not np.isfinite(pose).all()
                 or not np.isfinite(v) or not np.isfinite(omega)
                 or not np.isfinite(horizon_s) or horizon_s < 0
-                or not np.isfinite(step_s) or step_s <= 0):
+                or not np.isfinite(step_s) or step_s <= 0
+                or not np.isfinite(position_std) or position_std < 0):
             raise ValueError("command and pose must be finite with valid time limits")
         steps = max(1, int(math.ceil(horizon_s / step_s)),
+                    int(math.ceil(abs(omega) * horizon_s / (math.pi / 8))),
                     int(math.ceil(abs(v) * horizon_s /
                                   (self.config.resolution / 2))))
         dt = horizon_s / steps
+        angle = omega * dt
+        # 1-cos(a/2) = 2*sin(a/4)^2 avoids cancellation for tiny angles.
+        sagitta = (abs(v / omega) * 2 * math.sin(angle / 4) ** 2
+                    if omega else 0.0)
+        _, _, safe = self._safe_cells(position_std, extra_margin=sagitta)
         predicted = [pose.copy()]
         x, y, heading = pose
         for _ in range(steps):
-            if abs(omega) < 1e-9:
-                x += v * math.cos(heading) * dt
-                y += v * math.sin(heading) * dt
-            else:
-                next_heading = heading + omega * dt
-                x += v / omega * (math.sin(next_heading) - math.sin(heading))
-                y += v / omega * (math.cos(heading) - math.cos(next_heading))
-            heading += omega * dt
+            half_angle = angle / 2
+            travel = v * dt * (math.sin(half_angle) / half_angle if half_angle else 1.0)
+            x += travel * math.cos(heading + half_angle)
+            y += travel * math.sin(heading + half_angle)
+            heading += angle
             predicted.append((x, y, heading))
-        return self.trajectory_is_safe(np.asarray(predicted), position_std)
+        return self._path_is_safe(np.asarray(predicted)[:, :2], safe)
