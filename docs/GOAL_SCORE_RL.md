@@ -96,3 +96,24 @@ python -m unittest discover -s tests -q
 | 标签奖励 | -1.199 | -0.417 |
 
 该标签中保存的原算法实际输出奖励为 -1.082，不同于表中的全搜索 baseline。两个标签来自同一段近邻静止场景，以上仅是管线验证结果。自动测试共 79 项，包含策略梯度数值校验、角度环绕、读包预算与关闭、标签错配、模型读写、训练/验证隔离以及现有回放与安全算法回归。
+
+
+## Map-relative boundary direction (version 2)
+
+Fixed robot-relative direction features are replaced by unsigned along/across
+boundary distances, confidence-weighted squared parallel alignment, and direction
+confidence. The reference line is fitted once per goal search from accumulated
+`boundary_hits` near the robot, never from the current observation array. The
+closest mapped boundary must be within sensor range. PCA uses a local neighborhood
+of radius `min(sensor_range, max(0.3, 4*resolution))`; fewer than three cells,
+insufficient spread, or anisotropy below 0.6 produce no direction preference.
+Parallel and antiparallel headings are equivalent. Training and learned inference
+use parallel view headings if either direction sees frontier gain, otherwise retain
+the existing view heading. Goal holding and safety checks still apply. The learned
+parallel-alignment weight is constrained nonnegative during training.
+
+Both dataset and model schemas are now version 2. Existing version 1 artifacts
+must be regenerated from source replay with `prepare` and then retrained; changing
+JSON version numbers or reusing old direction weights is invalid. The checked-in
+model and training report have been updated for version 2. Closed-loop
+exploration performance still requires validation on separate logs.

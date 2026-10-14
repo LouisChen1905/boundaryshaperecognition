@@ -17,7 +17,7 @@ from goal_score_rl import (GoalScoreBanditEnv, GoalScorePolicy, bandit_gradient,
 
 def candidate(x, y, score=1., heading=0., cell=None):
     return GoalScoreCandidate(cell or (round(x*10), round(y*10)), (x, y, heading),
-        (0., 0., 0.), 3., 0., math.hypot(x, y), 0., 0, score, 2.)
+        (0., 0., 0.), 3., 0., math.hypot(x, y), 0., 0, score, 2., 0., 1.)
 
 
 def episode(number, timestamp):
@@ -46,8 +46,60 @@ class GoalScoreRLTests(unittest.TestCase):
         self.assertEqual(distance[0], 0.)
         c = candidate(0., 2.)
         c = GoalScoreCandidate(**{**asdict(c), "robot_pose": (0., 0., math.pi/2)})
-        self.assertAlmostEqual(features(c)[5], 1.)
-        self.assertAlmostEqual(features(c)[6], 0.)
+        self.assertAlmostEqual(features(c)[5], 0.)
+        self.assertAlmostEqual(features(c)[6], 1.)
+
+    def test_boundary_parallel_feature_is_unoriented_and_rotation_invariant(self):
+        c = candidate(1., 2., heading=.3)
+        opposite = GoalScoreCandidate(**{**asdict(c), "pose": (1., 2., .3 + math.pi)})
+        np.testing.assert_allclose(features(c), features(opposite))
+        rotated = GoalScoreCandidate(**{**asdict(c), "pose": (-2., 1., .3 + math.pi/2),
+            "robot_pose": (0., 0., math.pi/2), "boundary_tangent": math.pi/2})
+        np.testing.assert_allclose(features(c), features(rotated), atol=1e-12)
+        missing = GoalScoreCandidate(**{**asdict(c), "boundary_tangent": None,
+                                      "boundary_direction_confidence": 0.})
+        np.testing.assert_array_equal(features(missing)[5:], 0.)
+
+    def test_direction_uses_accumulated_map_and_rejects_ambiguous_geometry(self):
+        explorer = BoundaryExplorer(ExplorationConfig(robot_radius=.1, sensor_range=2.))
+        explorer.boundary_hits = {(i, 5): 2 for i in range(-8, 9)}
+        angle, confidence = explorer.nearby_boundary_direction((0., 0., 1.))
+        self.assertAlmostEqual(abs(math.cos(angle)), 1.)
+        self.assertAlmostEqual(confidence, 1.)
+        # A later frame need not contain any new boundary observations.
+        explorer._fuse_observation(set(), set(), 2.)
+        self.assertEqual(explorer.nearby_boundary_direction((0., 0., 1.)), (angle, confidence))
+        self.assertEqual(explorer.nearby_boundary_direction((10., 10., 0.)), (None, 0.))
+        explorer.boundary_hits = {(x, y): 2 for x in range(-2, 3) for y in range(-2, 3)}
+        self.assertEqual(explorer.nearby_boundary_direction((0., 0., 0.)), (None, 0.))
+
+    def test_candidates_use_map_parallel_headings(self):
+        explorer = BoundaryExplorer(ExplorationConfig(robot_radius=.1, sensor_range=1.,
+                                                       pose_margin=0., boundary_clearance=.1))
+        explorer.seed_verified_grass_disk((.05, .05), 1.)
+        explorer.boundary_hits = {(i, 6): 2 for i in range(-8, 9)}
+        candidates = explorer.goal_candidates((.05, .05, 1.))
+        self.assertTrue(candidates)
+        for c in candidates:
+            self.assertAlmostEqual(abs(math.cos(c.pose[2] - c.boundary_tangent)), 1.)
+            self.assertGreater(c.boundary_direction_confidence, .6)
+
+    def test_old_model_and_dataset_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model.json"
+            GoalScorePolicy().save(model)
+            record = json.loads(model.read_text())
+            record["schema_version"] = 1
+            model.write_text(json.dumps(record))
+            with self.assertRaises(ValueError):
+                GoalScorePolicy.load(model)
+            dataset = root / "dataset.json"
+            dataset.write_text(json.dumps(dict(schema_version=1, task="label_reward_contextual_bandit",
+                                               episodes=[episode(1, 1.)])))
+            from goal_score_rl import load_dataset
+            with self.assertRaises(ValueError):
+                load_dataset(dataset)
 
     def test_policy_gradient_matches_expected_reward_and_kl_derivative(self):
         x = np.array([[1., -.3], [.1, .8], [-.2, -.5]])
@@ -79,7 +131,7 @@ class GoalScoreRLTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dataset, model, report = (root / name for name in ("data.json", "model.json", "report.json"))
-            dataset.write_text(json.dumps(dict(schema_version=1, task="label_reward_contextual_bandit",
+            dataset.write_text(json.dumps(dict(schema_version=2, task="label_reward_contextual_bandit",
                 exploration_config={}, episodes=[episode(1, 1.), episode(2, 3.), episode(3, 6.)])))
             result = train(dataset, model, report, epochs=100)
             self.assertGreater(result["validation"]["policy_reward"], result["validation"]["baseline_reward"])

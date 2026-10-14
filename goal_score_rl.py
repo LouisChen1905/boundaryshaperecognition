@@ -18,22 +18,26 @@ from boundary_exploration import BoundaryExplorer, ExplorationConfig, GoalScoreC
 
 
 FEATURES = ("log_gain", "priority_fraction", "path_cost", "boundary_distance",
-            "visits", "local_x", "local_y", "heading_cos", "heading_sin")
-MODEL_VERSION = 1
+            "visits", "boundary_along_distance", "boundary_across_distance",
+            "boundary_parallel_alignment", "boundary_direction_confidence")
+MODEL_VERSION = 2
 
 
 def features(candidate):
     c = candidate
-    yaw = c.robot_pose[2]
     dx, dy = np.subtract(c.pose[:2], c.robot_pose[:2])
     scale = c.sensor_range
-    angle = c.pose[2] - yaw
+    tangent = c.boundary_tangent
+    confidence = c.boundary_direction_confidence if tangent is not None else 0.0
+    along = across = alignment = 0.0
+    if confidence:
+        along = abs(math.cos(tangent)*dx + math.sin(tangent)*dy) / scale
+        across = abs(-math.sin(tangent)*dx + math.cos(tangent)*dy) / scale
+        alignment = confidence * math.cos(c.pose[2] - tangent) ** 2
     return np.array([math.log1p(c.gain) / 5,
         c.boundary_gain / max(c.gain, 1e-9), c.path_cost / scale,
         c.boundary_distance / scale, c.visits / 3,
-        (math.cos(yaw)*dx + math.sin(yaw)*dy) / scale,
-        (-math.sin(yaw)*dx + math.cos(yaw)*dy) / scale,
-        math.cos(angle), math.sin(angle)]).clip(-5, 5)
+        along, across, alignment, confidence]).clip(-5, 5)
 
 
 def pose_errors(poses, desired):
@@ -174,7 +178,7 @@ def prepare(source, labels_path, output, config, max_records=15000, max_frames=8
     finally:
         stream.close()
     skipped.extend(dict(frame=n, reason="outside raw-record/frame budget") for n in sorted(pending))
-    record = dict(schema_version=1, task="label_reward_contextual_bandit", source=str(Path(source).resolve()),
+    record = dict(schema_version=2, task="label_reward_contextual_bandit", source=str(Path(source).resolve()),
         labels_source=str(Path(labels_path).resolve()), exploration_config=asdict(config),
         pose_max_gap_s=pose_max_gap_s, verified_start_radius=verified_start_radius,
         budgets=dict(max_records=max_records, max_frames=max_frames, max_labels=max_labels,
@@ -188,8 +192,8 @@ def prepare(source, labels_path, output, config, max_records=15000, max_frames=8
 
 def load_dataset(path):
     record = json.loads(Path(path).read_text(encoding="utf-8"))
-    if record.get("schema_version") != 1 or record.get("task") != "label_reward_contextual_bandit":
-        raise ValueError("incompatible training dataset")
+    if record.get("schema_version") != 2 or record.get("task") != "label_reward_contextual_bandit":
+        raise ValueError("incompatible training dataset; regenerate with prepare for map-boundary features v2")
     episodes = sorted(record["episodes"], key=lambda e: e["timestamp"])
     if not episodes:
         raise ValueError("no usable episodes; increase bounded budgets or check safety/configuration")
@@ -319,6 +323,7 @@ def train(dataset, model_path, report_path, epochs=300, learning_rate=.1, temper
         gradient = np.mean([bandit_gradient(policy.weights, *a, temperature, kl_weight)[0]
                             for a in arrays], axis=0) - l2 * policy.weights
         policy.weights += learning_rate * gradient
+        policy.weights[7] = max(0.0, policy.weights[7])
     metadata = dict(dataset=str(Path(dataset).resolve()), exploration_config=record["exploration_config"],
         training_frames=[e["frame"] for e in training], validation_frames=[e["frame"] for e in validation],
         epochs=epochs, learning_rate=learning_rate, temperature=temperature, kl_weight=kl_weight, l2=l2,
@@ -329,7 +334,7 @@ def train(dataset, model_path, report_path, epochs=300, learning_rate=.1, temper
         validation=evaluate(validation, policy, position_scale, yaw_scale),
         limitations=["Label reward does not measure closed-loop exploration success.",
                     "Chronological holdout from one log remains correlated; use separate logs for final testing.",
-                    "Candidate headings and hard boundary priority are fixed by the existing planner.",
+                    "Candidate headings use nearby accumulated-map boundary tangents when reliable; hard boundary priority remains fixed.",
                     "Baseline means full-search ranking; logged/replay rewards compare the staged original planner.",
                     "Training candidate cap can omit the optimum; inference searches all eligible candidates."])
     write_json(report_path, report)

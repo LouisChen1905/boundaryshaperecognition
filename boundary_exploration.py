@@ -133,6 +133,8 @@ class GoalScoreCandidate:
     visits: int
     baseline_score: float
     sensor_range: float
+    boundary_tangent: float = None
+    boundary_direction_confidence: float = 0.0
 
 
 class BoundaryExplorer:
@@ -422,6 +424,30 @@ class BoundaryExplorer:
         self._goal(pose, known, boundary, safe, candidates=candidates)
         return candidates
 
+    def nearby_boundary_direction(self, pose):
+        """Fit an unoriented local line using accumulated map cells only."""
+        points = np.array([self.center(c) for c in self.boundary_hits], dtype=float).reshape(-1, 2)
+        if len(points) < 3:
+            return None, 0.0
+        distances = np.linalg.norm(points - np.asarray(pose[:2]), axis=1)
+        nearest = int(np.argmin(distances))
+        if distances[nearest] > self.config.sensor_range:
+            return None, 0.0
+        # Fit locally around the closest boundary, avoiding remote parallel walls.
+        radius = min(self.config.sensor_range, max(.3, 4 * self.config.resolution))
+        local = points[np.linalg.norm(points - points[nearest], axis=1) <= radius]
+        if len(local) < 3:
+            return None, 0.0
+        centered = local - local.mean(axis=0)
+        values, vectors = np.linalg.eigh(centered.T @ centered / len(local))
+        if values[1] < self.config.resolution ** 2:
+            return None, 0.0
+        confidence = float((values[1] - values[0]) / (values[1] + values[0]))
+        if confidence < .6:
+            return None, 0.0
+        direction = vectors[:, 1]
+        return math.atan2(direction[1], direction[0]), confidence
+
     def _goal(self, pose, known, boundary, safe, performance=None, preferred_goal=None,
               candidates=None):
         started = perf_counter_ns()
@@ -505,6 +531,8 @@ class BoundaryExplorer:
         geometric_view = False
         preferred_cell = self.cell(preferred_goal[:2]) if preferred_goal is not None else None
 
+        tangent, direction_confidence = self.nearby_boundary_direction(pose)
+
         def score_cell(cell, path_cost):
             nonlocal candidate_pairs, sight_checks, cache_hits
             if cell not in safe:
@@ -541,6 +569,17 @@ class BoundaryExplorer:
                 return None
             if preferred_goal is None:
                 heading, gain, boundary_gain = self._view_heading(point, visible)
+                if tangent is not None and (candidates is not None or self.goal_scorer is not None):
+                    options = []
+                    for parallel in (tangent, math.atan2(math.sin(tangent + math.pi), math.cos(tangent + math.pi))):
+                        weights = [weight for target, weight in visible
+                                   if _bearing_difference(math.atan2(target[1] - point[1], target[0] - point[0]), parallel)
+                                   <= math.radians(self.config.sensor_fov_deg) / 2 + 1e-12]
+                        if weights:
+                            options.append((sum(w for w in weights if w == 2.0), sum(weights),
+                                            -_bearing_difference(parallel, pose[2]), parallel))
+                    if options:
+                        boundary_gain, gain, _, heading = max(options)
             else:
                 heading = preferred_goal[2]
                 weights = [weight for target, weight in visible
@@ -567,7 +606,7 @@ class BoundaryExplorer:
                 item = GoalScoreCandidate(cell, (point[0], point[1], float(heading)),
                     tuple(map(float, pose)), float(gain), float(boundary_gain),
                     float(path_cost), float(distance), self.goal_visits.get(cell, 0),
-                    float(score), float(sensor_range))
+                    float(score), float(sensor_range), tangent, direction_confidence)
                 if candidates is not None:
                     path = self._build_path(pose, cell, start, previous)
                     if self._path_is_safe(path, path_cells):
