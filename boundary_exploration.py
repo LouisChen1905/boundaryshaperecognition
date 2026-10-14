@@ -119,11 +119,28 @@ def _bearing_difference(first, second):
                           math.cos(first - second)))
 
 
+@dataclass(frozen=True)
+class GoalScoreCandidate:
+    """Geometry available to a scorer; manual targets are never input features."""
+
+    cell: tuple
+    pose: tuple
+    robot_pose: tuple
+    gain: float
+    boundary_gain: float
+    path_cost: float
+    boundary_distance: float
+    visits: int
+    baseline_score: float
+    sensor_range: float
+
+
 class BoundaryExplorer:
     """Build a sparse evidence grid and select safe boundary-viewing poses."""
 
-    def __init__(self, config):
+    def __init__(self, config, goal_scorer=None):
         self.config = config
+        self.goal_scorer = goal_scorer
         self.grass_hits = {}
         self.boundary_hits = {}
         self.last_seen = {}
@@ -219,6 +236,30 @@ class BoundaryExplorer:
                                                    2 * position_std) + extra_margin
         body_offsets = self._disk_offsets(footprint)
         boundary_offsets = self._disk_offsets(footprint + self.config.boundary_clearance)
+        # Apply the identical footprint tests in bulk. Bound memory for sparse
+        # maps whose coordinates span a very large area; use the sparse fallback.
+        if known:
+            coordinates = np.asarray(list(known), dtype=np.int64)
+            low = coordinates.min(axis=0)
+            span = coordinates.max(axis=0) - low + 1
+            pad = max(max(abs(dx), abs(dy)) for dx, dy in boundary_offsets)
+            shape = tuple(int(n) + 2 * pad for n in span)
+            if shape[0] * shape[1] <= 4_000_000:
+                grass_grid = np.zeros(shape, dtype=bool)
+                boundary_grid = np.zeros(shape, dtype=bool)
+                indices = coordinates - low + pad
+                x, y = indices.T
+                grass_grid[x, y] = True
+                if boundary:
+                    b = np.asarray(list(boundary), dtype=np.int64) - low + pad
+                    b = b[np.all((b >= 0) & (b < shape), axis=1)]
+                    boundary_grid[b[:, 0], b[:, 1]] = True
+                valid = np.ones(len(coordinates), dtype=bool)
+                for dx, dy in body_offsets:
+                    valid &= grass_grid[x + dx, y + dy]
+                for dx, dy in boundary_offsets:
+                    valid &= ~boundary_grid[x + dx, y + dy]
+                return known, boundary, set(map(tuple, coordinates[valid].tolist()))
         safe = set()
         for x, y in known:
             if any((x + dx, y + dy) not in known for dx, dy in body_offsets):
@@ -362,14 +403,34 @@ class BoundaryExplorer:
             boundary_gain -= weight if weight == 2.0 else 0.0
         return best[2], best[1], best[0]
 
-    def _goal(self, pose, known, boundary, safe, performance=None, preferred_goal=None):
+    def goal_candidates(self, robot_pose, position_std=0.0):
+        """Enumerate baseline-positive safe views without assigning a goal.
+
+        Full search is intentional for training. Map evidence/visits are unchanged;
+        visibility caches may be populated. Every returned path passes the same
+        safety check as an assigned goal. Boundary priority remains a hard rule.
+        """
+        pose = np.asarray(robot_pose, dtype=float)
+        if pose.shape != (3,) or not np.isfinite(pose).all():
+            raise ValueError("robot_pose must be finite (x, y, yaw)")
+        if not math.isfinite(position_std) or position_std < 0:
+            raise ValueError("position_std must be finite and nonnegative")
+        known, boundary, safe = self._safe_cells(position_std)
+        if self._boundary_closed(self.cell(pose[:2])):
+            return []
+        candidates = []
+        self._goal(pose, known, boundary, safe, candidates=candidates)
+        return candidates
+
+    def _goal(self, pose, known, boundary, safe, performance=None, preferred_goal=None,
+              candidates=None):
         started = perf_counter_ns()
         if performance is not None:
             performance["boundary_frontier_cells"] = 0
             performance["goal_boundary_gain"] = 0.0
             performance["goal_boundary_distance"] = ""
         start = self.cell(pose[:2])
-        if not self._path_is_safe([pose[:2]], safe):
+        if start not in known or start in boundary:
             if performance is not None:
                 performance["goal_reach_ms"] = 0.0
                 performance["goal_frontier_ms"] = 0.0
@@ -381,9 +442,11 @@ class BoundaryExplorer:
                 performance["sight_cache_hits"] = 0
                 performance["goal_search_radius"] = ""
                 performance["goal_visible_gain"] = 0.0
-            return None, np.empty((0, 2)), "robot footprint lacks confirmed grass"
+            return None, np.empty((0, 2)), "robot position lacks confirmed grass"
         previous = {}
-        paths = self._reachable_paths(start, safe, previous)
+        # Only the confirmed-grass start is exempt from footprint clearance.
+        path_cells = safe | {start}
+        paths = self._reachable_paths(start, path_cells, previous)
         reach_ns = 0
         reachable_cells = 0
         started = perf_counter_ns()
@@ -444,6 +507,8 @@ class BoundaryExplorer:
 
         def score_cell(cell, path_cost):
             nonlocal candidate_pairs, sight_checks, cache_hits
+            if cell not in safe:
+                return None
             point = tuple(self.center(cell))
             if preferred_goal is None:
                 distance_from_pose = math.hypot(point[0] - pose[0], point[1] - pose[1])
@@ -497,11 +562,28 @@ class BoundaryExplorer:
             score = (effective_gain / (1 + path_cost
                      + self.config.boundary_distance_weight * distance)
                      - 2 * self.goal_visits.get(cell, 0))
+            if ((candidates is not None or self.goal_scorer is not None)
+                    and score > 0 and cell not in self._excluded_goals):
+                item = GoalScoreCandidate(cell, (point[0], point[1], float(heading)),
+                    tuple(map(float, pose)), float(gain), float(boundary_gain),
+                    float(path_cost), float(distance), self.goal_visits.get(cell, 0),
+                    float(score), float(sensor_range))
+                if candidates is not None:
+                    path = self._build_path(pose, cell, start, previous)
+                    if self._path_is_safe(path, path_cells):
+                        candidates.append(item)
+                if self.goal_scorer is not None:
+                    score = float(self.goal_scorer(item))
+                    if not math.isfinite(score) or score <= 0:
+                        raise ValueError("goal_scorer must return a finite positive score")
             return ((boundary_gain > 0, score, -path_cost, cell, heading),
                     gain, boundary_gain, distance)
 
         pending = None
-        radii = (float("inf"),) if preferred_goal is not None else (*self.config.path_radii, float("inf"))
+        full_search = (candidates is not None
+                       or getattr(self.goal_scorer, "full_goal_search", False))
+        radii = ((float("inf"),) if preferred_goal is not None or full_search
+                 else (*self.config.path_radii, float("inf")))
         for radius in radii:
             stage_best = None
             stage_gain = 0.0
@@ -540,7 +622,7 @@ class BoundaryExplorer:
                 # A local generic frontier must not hide a boundary frontier
                 # reachable at a later radius. Exhaustion still permits fallback.
                 qualifying_gain = boundary_gain if boundary_frontier_count else gain
-                if (qualifying_gain >= self.config.min_visible_gain and rank[1] > 0
+                if (not full_search and qualifying_gain >= self.config.min_visible_gain and rank[1] > 0
                         and (stage_best is None or rank[:4] > stage_best[:4])):
                     stage_best = rank
                     stage_gain = gain
@@ -577,7 +659,7 @@ class BoundaryExplorer:
         _, _, _, target_cell, heading = best
         target = self.center(target_cell)
         path = self._build_path(pose, target_cell, start, previous)
-        if not self._path_is_safe(path, safe):
+        if not self._path_is_safe(path, path_cells):
             return None, np.empty((0, 2)), "unsafe path from robot pose"
         return (float(target[0]), float(target[1]), heading), path, "safe frontier viewpoint"
 
@@ -694,12 +776,12 @@ class BoundaryExplorer:
             self._release_goal()
             status, reason, goal, path = ("complete",
                 "confirmed boundary encloses robot on grid", None, np.empty((0, 2)))
-        elif not self._path_is_safe([pose[:2]], safe):
+        elif self.cell(pose[:2]) not in known or self.cell(pose[:2]) in boundary:
             if self.active_goal is not None:
                 release_reason = "robot_unsafe"
             self._release_goal()
             status, reason, goal, path = ("waiting_for_observation",
-                "robot footprint lacks confirmed grass", None, np.empty((0, 2)))
+                "robot position lacks confirmed grass", None, np.empty((0, 2)))
         else:
             goal = None
             held_performance = {} if performance is not None else None

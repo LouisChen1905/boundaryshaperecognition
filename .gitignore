@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local capture data and generated training dataset
+/navigation-data.jsonl
+/*.log
+/rl_artifacts/dataset.json
+/.vscode/

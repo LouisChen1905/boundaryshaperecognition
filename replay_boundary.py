@@ -27,6 +27,7 @@ from boundary_shape import (grass_inside_support, grass_reference_coverage,
                             orient_tracking_reference, recognize, reference_side,
                             tracking_reference)
 from boundary_exploration import BoundaryExplorer, ExplorationConfig
+from goal_pose_labels import GoalPoseLabels, GoalPoseAnnotator
 
 
 LOG_PATTERN = re.compile(
@@ -49,7 +50,7 @@ EXPLORATION_PERFORMANCE_FIELDS = [
     "goal_boundary_gain", "goal_boundary_distance", "map_version",
     "observation_fused", "removed_boundary_cells", "goal_action",
     "goal_release_reason", "goal_visit_count", "pose_alignment",
-    "pose_before_timestamp", "pose_after_timestamp", "pose_gap_ms"]
+    "pose_before_timestamp", "pose_after_timestamp", "pose_gap_ms", "display_skipped"]
 
 
 @dataclass
@@ -211,6 +212,8 @@ def iter_data_package(path: Path, max_records: Optional[int] = None,
              "skipped_pose_gap", "skipped_before_pose_history",
              "skipped_no_future_pose", "skipped_pending_overflow")
     stats.update({name: 0 for name in names})
+    stats["raw_records_read"] = 0
+    stats["raw_bytes_read"] = 0
     pose_times, poses = [], []
     pending = deque()
     previous_time = None
@@ -272,6 +275,8 @@ def iter_data_package(path: Path, max_records: Optional[int] = None,
     with path.open("r", encoding="utf-8-sig") as source:
         records = source if max_records is None else islice(source, max_records)
         for number, line in enumerate(records, 1):
+            stats["raw_records_read"] = number
+            stats["raw_bytes_read"] += len(line.encode("utf-8"))
             try:
                 record = json.loads(line)
                 topic = record.get("topic")
@@ -463,11 +468,20 @@ def _cell_polygons(cells, resolution):
     return origins[:, None, :] + corners[None, :, :]
 
 
+def same_robot_pose(first: Frame, second: Frame, position_tolerance=0.03,
+                    angle_tolerance_deg=2.0):
+    """Compare against a fixed anchor, including wrapped 3D attitude."""
+    relative = rotation(*first.robot_rpy).T @ rotation(*second.robot_rpy)
+    angle = np.arccos(np.clip((np.trace(relative) - 1) / 2, -1, 1))
+    return (np.linalg.norm(first.robot_xyz - second.robot_xyz) <= position_tolerance
+            and angle <= np.radians(angle_tolerance_deg))
+
+
 def profile_exploration_stream(frames, config: ExplorationConfig,
                                performance_log: Path,
-                               verified_start_radius=None):
+                               verified_start_radius=None, goal_scorer=None):
     """Run the same exploration updates without plotting, writing every frame."""
-    explorer = BoundaryExplorer(config)
+    explorer = BoundaryExplorer(config, goal_scorer=goal_scorer)
     count = 0
     totals = {name: 0.0 for name in EXPLORATION_PERFORMANCE_FIELDS
               if name.endswith("_ms")}
@@ -513,12 +527,18 @@ def profile_exploration_stream(frames, config: ExplorationConfig,
 
 def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
                               verified_start_radius=None, history_size=50,
-                              performance_log=None) -> None:
+                              performance_log=None, labels_path=None, source_path=None,
+                              static_position_tolerance=0.03,
+                              static_angle_tolerance_deg=2.0, goal_scorer=None) -> None:
     """Replay an iterator incrementally and display the explorer's live map.
 
     Previous/Next use a bounded cache. Revisiting a cached frame never feeds
     that observation into the explorer a second time.
     """
+    if (labels_path is not None and performance_log is not None
+            and Path(labels_path).resolve() == Path(performance_log).resolve()):
+        raise ValueError("Goal labels and performance log must use different files")
+    label_store = GoalPoseLabels(labels_path, source_path) if labels_path is not None else None
     frame_iter = iter(frames)
     first_read_started = perf_counter_ns()
     first = next(frame_iter, None)
@@ -526,7 +546,7 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
     if first is None:
         raise ValueError("No visual boundary frames with location in the data package")
     source = chain((first,), frame_iter)
-    explorer = BoundaryExplorer(config)
+    explorer = BoundaryExplorer(config, goal_scorer=goal_scorer)
     if verified_start_radius is not None:
         explorer.seed_verified_grass_disk(first.robot_xyz[:2], verified_start_radius)
     performance_file = None
@@ -581,13 +601,32 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
     previous_button = Button(fig.add_axes((0.18, 0.04, 0.15, 0.06)), "Previous")
     play_button = Button(fig.add_axes((0.42, 0.04, 0.15, 0.06)), "Pause")
     next_button = Button(fig.add_axes((0.66, 0.04, 0.15, 0.06)), "Next")
+    skip_button = Button(fig.add_axes((0.42, 0.112, 0.18, 0.035)), "Skip static [S]")
+    skip_text = fig.text(.02, .125, "", fontsize=9)
     history = deque(maxlen=history_size)
     state = {"index": -1, "playing": True, "ended": False, "number": 0,
-             "previous_time": None}
+             "previous_time": None, "skipping": False, "skip_count": 0}
+
+    def cancel_skip():
+        if state["skipping"]:
+            skip_text.set_text("Skipped {} static frames (stopped)".format(state["skip_count"]))
+        state["skipping"] = False
+        skip_timer.stop()
+
+    def pause_for_label():
+        cancel_skip()
+        state["playing"] = False
+        timer.stop()
+        play_button.label.set_text("Play")
+
+    annotator = (GoalPoseAnnotator(fig, ax, label_store,
+                                   pause_for_label) if label_store is not None else None)
 
     def show(entry, performance=None):
         artist_started = perf_counter_ns()
         number, frame, result = entry
+        if annotator is not None:
+            annotator.show(number, frame, result.goal_pose)
         resolution = config.resolution
         grass_cells.set_verts(_cell_polygons(result.known_grass, resolution))
         safe_cells.set_verts(_cell_polygons(result.safe_cells, resolution))
@@ -652,10 +691,11 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
             fig.canvas.draw()
             performance["render_ms"] = (perf_counter_ns() - render_started) / 1e6
 
-    def advance():
+    def advance(render=True):
         if state["index"] + 1 < len(history):
             state["index"] += 1
-            show(history[state["index"]])
+            if render:
+                show(history[state["index"]])
             return True
         if state["ended"]:
             return False
@@ -673,10 +713,19 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
         state["index"] = len(history) - 1
         if state["previous_time"] is not None:
             delay = (frame.timestamp - state["previous_time"]) * 1000 / speed
-            timer.interval = max(20, min(1000, int(delay))) if delay > 0 else 100
+            elapsed = (perf_counter_ns() - callback_started) / 1e6
+            timer.interval = max(1, min(1000, int(delay - elapsed))) if delay > 0 else 1
         state["previous_time"] = frame.timestamp
-        show(history[-1], performance)
+        if render:
+            show(history[-1], performance)
+            if state["previous_time"] is not None and state["number"] > 1:
+                elapsed = (perf_counter_ns() - callback_started) / 1e6
+                timer.interval = max(1, min(1000, int(delay - elapsed))) if delay > 0 else 1
+        elif performance is not None:
+            performance["artist_update_ms"] = 0.0
+            performance["render_ms"] = 0.0
         if performance_writer is not None:
+            performance["display_skipped"] = int(not render)
             performance["frame"] = state["number"]
             performance["timestamp"] = frame.timestamp
             performance["reader_ms"] = (first_read_ms if state["number"] == 1
@@ -690,6 +739,53 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
         return True
 
     timer = fig.canvas.new_timer(interval=max(20, int(100 / speed)))
+    skip_timer = fig.canvas.new_timer(interval=1)
+    state["last_skip_display_ns"] = 0
+
+    def skip_chunk():
+        if not state["skipping"]:
+            return
+        started = perf_counter_ns()
+        # Yield to the GUI regularly so long stationary recordings can be cancelled.
+        for _ in range(50):
+            if not advance(render=False):
+                cancel_skip()
+                break
+            current = history[state["index"]][1]
+            if not same_robot_pose(state["skip_anchor"], current,
+                                   static_position_tolerance,
+                                   static_angle_tolerance_deg):
+                cancel_skip()
+                break
+            state["skip_count"] += 1
+            if (perf_counter_ns() - started) / 1e6 >= 25:
+                break
+        now = perf_counter_ns()
+        if not state["skipping"] or now - state["last_skip_display_ns"] >= 250_000_000:
+            skip_text.set_text("Skipped {} static frames{}".format(
+                state["skip_count"], " (working...)" if state["skipping"] else ""))
+            show(history[state["index"]])
+            state["last_skip_display_ns"] = now
+        if state["skipping"]:
+            skip_timer.start()
+
+    skip_timer.add_callback(skip_chunk)
+
+    def skip_static(event=None):
+        if state["skipping"]:
+            cancel_skip()
+            return
+        pause_for_label()
+        if annotator is not None and annotator.active:
+            annotator.cancel()
+        state["skip_anchor"] = history[state["index"]][1]
+        state["skip_count"] = 0
+        state["skipping"] = True
+        skip_text.set_text("Skipping static frames...")
+        skip_timer.start()
+        fig.canvas.draw_idle()
+
+    skip_button.on_clicked(skip_static)
 
     def tick():
         if state["playing"] and not advance():
@@ -701,6 +797,9 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
     timer.add_callback(tick)
 
     def toggle(event):
+        cancel_skip()
+        if annotator is not None and annotator.active:
+            annotator.cancel()
         state["playing"] = not state["playing"]
         play_button.label.set_text("Pause" if state["playing"] else "Play")
         if state["playing"]:
@@ -710,21 +809,30 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
         fig.canvas.draw_idle()
 
     def previous(event):
+        cancel_skip()
         if state["index"] > 0:
             state["index"] -= 1
             show(history[state["index"]])
 
     play_button.on_clicked(toggle)
     previous_button.on_clicked(previous)
-    next_button.on_clicked(lambda event: advance())
+    def next_frame(event=None):
+        cancel_skip()
+        advance()
+
+    next_button.on_clicked(next_frame)
 
     def on_key(event):
         if event.key == "left":
             previous(event)
         elif event.key == "right":
-            advance()
+            next_frame()
         elif event.key == " ":
             toggle(event)
+        elif event.key == "s":
+            skip_static()
+        elif event.key == "escape":
+            cancel_skip()
 
     fig.canvas.mpl_connect("key_press_event", on_key)
     advance()
@@ -733,6 +841,7 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
         plt.show()
     finally:
         timer.stop()
+        skip_timer.stop()
         if performance_file is not None:
             performance_file.close()
         close = getattr(frame_iter, "close", None)
@@ -742,7 +851,7 @@ def replay_exploration_stream(frames, speed: float, config: ExplorationConfig,
 
 def replay(frames: list[Frame], speed: float, min_turn_radius=None,
            robot_width=None, right_half_width=None,
-           grass_support_radius=0.25) -> None:
+           grass_support_radius=0.25, labels_path=None, source_path=None) -> None:
     world_shapes = fit_world_shapes(frames, min_turn_radius)
     fig, (ax, camera_ax) = plt.subplots(1, 2, figsize=(15, 7))
     fig.subplots_adjust(bottom=0.22, top=0.78, wspace=0.28)
@@ -823,6 +932,14 @@ def replay(frames: list[Frame], speed: float, min_turn_radius=None,
     next_button = Button(fig.add_axes((0.66, 0.04, 0.15, 0.05)), "Next")
     state = {"playing": False}
 
+    def pause_for_label():
+        state["playing"] = False
+        timer.stop()
+        play_button.label.set_text("Play")
+
+    annotator = (GoalPoseAnnotator(fig, ax, GoalPoseLabels(labels_path, source_path),
+                                   pause_for_label) if labels_path is not None else None)
+
     def show_direction(line, arrow):
         if line is None:
             arrow.set_visible(False)
@@ -838,6 +955,8 @@ def replay(frames: list[Frame], speed: float, min_turn_radius=None,
 
     def show(index: int) -> None:
         frame = frames[index]
+        if annotator is not None:
+            annotator.show(index + 1, frame)
         points_artist.set_offsets(frame.world_points[:, :2])
         camera_artist.set_offsets(frame.camera_xz)
         grass = frame.grass_world_xy
@@ -930,6 +1049,8 @@ def replay(frames: list[Frame], speed: float, min_turn_radius=None,
     timer.add_callback(tick)
 
     def toggle(event) -> None:
+        if annotator is not None and annotator.active:
+            annotator.cancel()
         state["playing"] = not state["playing"]
         play_button.label.set_text("Pause" if state["playing"] else "Play")
         if state["playing"]:
@@ -1010,9 +1131,21 @@ def main() -> None:
                         help="Write per-frame JSONL replay timings to this CSV")
     parser.add_argument("--profile-only", action="store_true",
                         help="Process JSONL frames and write timing CSV without opening a plot")
+    parser.add_argument("--goal-labels", type=Path,
+                        help="Desired goal labels JSONL (default: <log stem>_goal_labels.jsonl in cwd)")
+    parser.add_argument("--goal-score-model", type=Path,
+                        help="Learned positive score residual JSON (JSONL exploration only; full search)")
+    parser.add_argument("--static-position-tolerance", type=float, default=0.03,
+                        help="Static-skip position tolerance in meters relative to its starting pose")
+    parser.add_argument("--static-angle-tolerance-deg", type=float, default=2.0,
+                        help="Static-skip 3D attitude tolerance in degrees")
     args = parser.parse_args()
     if args.speed <= 0:
         parser.error("--speed must be positive")
+    if (not np.isfinite(args.static_position_tolerance) or args.static_position_tolerance < 0
+            or not np.isfinite(args.static_angle_tolerance_deg)
+            or not 0 <= args.static_angle_tolerance_deg <= 180):
+        parser.error("Static tolerances must be finite: position >= 0, angle in [0, 180]")
     if args.min_turn_radius is not None and args.min_turn_radius < 0:
         parser.error("--min-turn-radius must be nonnegative")
     if args.robot_width is not None and args.robot_width <= 0:
@@ -1045,6 +1178,15 @@ def main() -> None:
             boundary_clear_observations=args.boundary_clear_observations)
     except ValueError as error:
         parser.error(str(error))
+    goal_scorer = None
+    if args.goal_score_model is not None:
+        if args.log.suffix.lower() != ".jsonl":
+            parser.error("--goal-score-model requires a JSONL exploration replay")
+        from goal_score_rl import GoalScorePolicy
+        try:
+            goal_scorer = GoalScorePolicy.load(args.goal_score_model)
+        except (ValueError, KeyError, OSError) as error:
+            parser.error(str(error))
     if args.log.suffix.lower() == ".jsonl":
         if args.grass_csv:
             parser.error("--grass-csv is only supported for the text log replay")
@@ -1056,7 +1198,8 @@ def main() -> None:
             performance_log = args.performance_log or Path("exploration_performance.csv")
             count, totals, maximum = profile_exploration_stream(
                 frames,
-                exploration_config, performance_log, args.verified_start_radius)
+                exploration_config, performance_log, args.verified_start_radius,
+                goal_scorer=goal_scorer)
             print(f"Profiled {count} visual frames; CSV: {performance_log}")
             print("Total ms by stage: " + ", ".join(
                 f"{name}={totals[name]:.1f}" for name in
@@ -1068,7 +1211,12 @@ def main() -> None:
         replay_exploration_stream(frames,
                                   args.speed, exploration_config,
                                   args.verified_start_radius,
-                                  performance_log=args.performance_log)
+                                  performance_log=args.performance_log,
+                                  labels_path=args.goal_labels or Path(args.log.stem + "_goal_labels.jsonl"),
+                                  source_path=args.log,
+                                  static_position_tolerance=args.static_position_tolerance,
+                                  static_angle_tolerance_deg=args.static_angle_tolerance_deg,
+                                  goal_scorer=goal_scorer)
         return
     if args.profile_only:
         parser.error("--profile-only requires a JSONL log")
@@ -1076,7 +1224,9 @@ def main() -> None:
     if args.grass_csv:
         load_grass_csv(args.grass_csv, frames)
     replay(frames, args.speed, args.min_turn_radius, args.robot_width,
-           args.right_half_width, args.grass_support_radius)
+           args.right_half_width, args.grass_support_radius,
+           labels_path=args.goal_labels or Path(args.log.stem + "_goal_labels.jsonl"),
+           source_path=args.log)
 
 
 if __name__ == "__main__":

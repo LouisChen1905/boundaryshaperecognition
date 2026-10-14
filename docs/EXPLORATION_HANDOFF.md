@@ -1,3 +1,5 @@
+更新（2026-10-14）：路径起点只要求所在格为已确认草坪且不是边界，无需满足足迹安全余量。仅起点格可接入安全格路径，其余路径格和目标点仍须满足安全要求。trajectory_is_safe / command_is_safe 的执行校验仍保留完整安全要求。
+
 # 边界探索算法交接
 
 更新日期：2026-09-30。提交基线为 `5014ae9`。**多级路径半径搜索及本轮安全、证据、目标生命周期修复均已实现于工作区，尚未提交。** 工作区原有 README、边界优先策略、回放及测试修改已保留；继续工作前检查 `git status`，不要覆盖已有修改或把日志、`.vscode`、`__pycache__` 意外加入提交。
@@ -104,13 +106,13 @@ python -m unittest discover -q
 
 本轮增加：周期/位移/航向触发重选、±π 航向差、同时间戳位姿变化触发刷新、重选同格不推迟停滞、地图变化不推迟周期；延迟点云匹配历史定位、等待未来定位、不超读取上限、禁止系统时间回退、缺定位/大间隔拒绝、乱序定位、完整姿态插值及万向节锁表示。
 
-对用户新提供的工作区 `navigation-data.jsonl` 仅检查前 1000 条记录，含 878 条定位、61 帧边界点云。61 帧全部对齐：4 帧精确匹配、57 帧插值，插值定位跨度均为 20 ms，无跳过。旧“最新定位”时间比点云采样晚 207–326 ms，中位数 266 ms，证实原配对存在时间错位。新结果写入 `exploration_alignment_sample.csv`；算法耗时中位数约 3.01 ms，回调约 11.25 ms，无渲染。本段 61 帧均为 `waiting_for_observation`，因此不用于声称真实数据中的目标搜索或刷新性能已验证。
+对用户新提供的工作区 `navigation-data.jsonl` 仅检查前 1000 条记录，含 878 条定位、61 帧边界点云。61 帧全部对齐：4 帧精确匹配、57 帧插值，插值定位跨度均为 20 ms，无跳过。旧“最新定位”时间比点云采样晚 207–326 ms，中位数 266 ms，证实原配对存在时间错位。新结果写入 `reports/exploration_alignment_sample.csv`；算法耗时中位数约 3.01 ms，回调约 11.25 ms，无渲染。本段 61 帧均为 `waiting_for_observation`，因此不用于声称真实数据中的目标搜索或刷新性能已验证。
 
 以下历史 CSV 是修复前的诊断数据，未覆盖新的生命周期、更保守安全范围或时间戳对齐：
 
-- `exploration_performance.csv`：784 帧。
-- `exploration_performance2.csv`：2423 帧。
-- `exploration_performance3.csv`：1695 帧，前 748 帧等待观测，947 个探索帧全部停在 1 米层级。
+- `reports/exploration_performance.csv`：784 帧。
+- `reports/exploration_performance2.csv`：2423 帧。
+- `reports/exploration_performance3.csv`：1695 帧，前 748 帧等待观测，947 个探索帧全部停在 1 米层级。
 - 后两份日志共有帧的时间戳、状态、输入点数、草坪/边界/安全格计数一致。第 1000–1499 帧统计如下（单位 ms）：
 
 | 指标 | performance2 | performance3 |

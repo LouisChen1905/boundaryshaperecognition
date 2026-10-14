@@ -11,6 +11,26 @@ from boundary_exploration import (BoundaryExplorer, ExplorationConfig,
 
 
 class BoundaryExplorerTests(unittest.TestCase):
+    def test_bulk_safety_matches_sparse_footprint_checks(self):
+        rng = np.random.default_rng(42)
+        for sparse in (False, True):
+            explorer = self.explorer()
+            explorer.grass_hits = {(x, y): 2 for x in range(-15, 16)
+                                   for y in range(-15, 16) if rng.random() > .02}
+            explorer.boundary_hits = {(x, -16): 1 for x in range(-16, 17)}
+            explorer.boundary_hits[(5, 5)] = 1
+            if sparse:
+                explorer.grass_hits[(100000, -100000)] = 2
+            for std, margin in ((0., 0.), (.13, 0.), (.02, .17)):
+                known, boundary, actual = explorer._safe_cells(std, margin)
+                radius = explorer.config.robot_radius + max(explorer.config.pose_margin, 2*std) + margin
+                body = explorer._disk_offsets(radius)
+                clearance = explorer._disk_offsets(radius + explorer.config.boundary_clearance)
+                expected = {(x, y) for x, y in known
+                            if all((x+dx, y+dy) in known for dx, dy in body)
+                            and all((x+dx, y+dy) not in boundary for dx, dy in clearance)}
+                self.assertEqual(actual, expected)
+
     @staticmethod
     def explorer():
         return BoundaryExplorer(ExplorationConfig(robot_radius=0.1,
@@ -41,6 +61,46 @@ class BoundaryExplorerTests(unittest.TestCase):
                                                                 [2., 0., 0.]])))
         self.assertTrue(explorer.command_is_safe((0., 0., 0.), 0.1, 0., 1.0))
         self.assertFalse(explorer.command_is_safe((0., 0., 0.), 1.0, 0., 2.0))
+
+    def test_grass_start_without_safe_footprint_can_plan_and_hold_safe_goal(self):
+        explorer = BoundaryExplorer(ExplorationConfig(.1, 1., pose_margin=0.,
+                                                     boundary_clearance=0.))
+        explorer.grass_hits = {(x, y): 2 for x in range(21) for y in range(-10, 11)}
+        pose = (.15, .05, 0.)
+        first = explorer.update([], [], pose, 0.)
+        start = explorer.cell(pose[:2])
+        self.assertIn(start, first.known_grass)
+        self.assertNotIn(start, first.safe_cells)
+        self.assertEqual(first.status, "exploring")
+        self.assertIn(explorer.cell(first.goal_pose[:2]), first.safe_cells)
+        np.testing.assert_array_equal(first.path_xy[0], pose[:2])
+        self.assertTrue(explorer._path_is_safe(first.path_xy, first.safe_cells | {start}))
+        # Execution validation still requires the full footprint to be safe.
+        self.assertFalse(explorer.trajectory_is_safe(np.array([pose])))
+        metrics = {}
+        held = explorer.update([], [], pose, .1, performance=metrics)
+        self.assertEqual(held.goal_pose, first.goal_pose)
+        self.assertEqual(metrics["goal_action"], "held")
+
+    def test_start_exception_does_not_allow_unknown_boundary_or_unsafe_goal(self):
+        explorer = self.explorer()
+        known = {(0, 0), (1, 0), (2, 0)}
+        safe = {(1, 0)}
+        with patch.object(explorer, "_frontiers", return_value={(2, 0)}):
+            for known_cells, boundary in ((known - {(0, 0)}, set()),
+                                          (known, {(0, 0)})):
+                goal, path, _ = explorer._goal((.05, .05, 0.), known_cells, boundary, safe)
+                self.assertIsNone(goal)
+                self.assertEqual(len(path), 0)
+            # A held goal at the exempt start must be released, not accepted.
+            goal, path, _ = explorer._goal((.05, .05, 0.), known, set(), safe,
+                                         preferred_goal=(.05, .05, 0.))
+            self.assertIsNone(goal)
+            self.assertEqual(len(path), 0)
+            # A grass corridor cannot bridge further non-safe cells.
+            goal, path, _ = explorer._goal((.05, .05, 0.), known, set(), {(2, 0)})
+            self.assertIsNone(goal)
+            self.assertEqual(len(path), 0)
 
     def test_verified_start_patch_is_explicit_and_never_implied_by_pose(self):
         explorer = self.explorer()
