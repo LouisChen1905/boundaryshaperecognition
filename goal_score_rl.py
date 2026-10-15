@@ -108,7 +108,7 @@ def load_labels(path, source, max_labels=4, max_label_records=128):
                 raise ValueError(f"label {line_number}: source mismatch")
             if (record.get("schema_version") != 1 or record.get("coordinate_frame") != "world_xy"
                     or record.get("yaw_unit") != "radians"
-                    or record.get("label_type") != "manual_desired_pose"):
+                    or record.get("label_type") not in ("manual_desired_pose", "motor_cut_trajectory_goal")):
                 raise ValueError(f"label {line_number}: unsupported schema")
             frame, timestamp = record["frame"], record["timestamp"]
             for name in ("robot_pose_world", "desired_goal_world"):
@@ -118,6 +118,18 @@ def load_labels(path, source, max_labels=4, max_label_records=128):
                 raise ValueError(f"label {line_number}: invalid frame/timestamp")
             if frame in keys:
                 raise ValueError(f"label {line_number}: duplicate frame")
+            if record["label_type"] == "motor_cut_trajectory_goal":
+                provenance = record.get("provenance", {})
+                motor, target_motor = record.get("motor_cut", {}), provenance.get("target_motor_cut", {})
+                if (provenance.get("method") != "future_active_trajectory_distance"
+                        or provenance.get("target_frame", 0) <= frame
+                        or not math.isfinite(provenance.get("target_timestamp", float("nan")))
+                        or provenance["target_timestamp"] <= timestamp
+                        or not all(math.isfinite(m.get("rpm", float("nan"))) and abs(m["rpm"]) > 0
+                                   for m in (motor, target_motor))
+                        or motor.get("active_since") is None
+                        or motor["active_since"] != target_motor.get("active_since")):
+                    raise ValueError(f"label {line_number}: invalid motor trajectory provenance")
             keys.add(frame)
             labels.append(record)
     labels.sort(key=lambda r: r["frame"])
@@ -171,6 +183,7 @@ def prepare(source, labels_path, output, config, max_records=15000, max_frames=8
             desired = [label["desired_goal_world"][k] for k in ("x", "y", "yaw")]
             all_rewards = rewards([c.pose for c in eligible], desired)
             episodes.append(dict(frame=number, timestamp=frame.timestamp, desired_pose=desired,
+                label_type=label["label_type"], label_provenance=label.get("provenance"),
                 candidates=[asdict(c) for c in retained], eligible_count=len(eligible),
                 safe_candidate_count=len(candidates), oracle_all_reward=float(all_rewards.max()),
                 logged_algorithm_goal=label.get("algorithm_goal_world"),
@@ -271,8 +284,17 @@ def split_episodes(episodes, train_fraction=.75, gap_s=1.):
         raise ValueError("at least two usable labels needed for train/validation")
     cut = min(len(episodes)-1, max(1, int(len(episodes)*train_fraction)))
     train = episodes[:cut]
-    validation = [e for e in episodes[cut:] if e["timestamp"] - train[-1]["timestamp"] >= gap_s]
+    # Trajectory targets use future observations as supervision. Validation
+    # must start after that evidence, even when the requested gap is smaller.
+    target_times = [(e.get("label_provenance") or {})["target_timestamp"]
+                    for e in train if e.get("label_type") == "motor_cut_trajectory_goal"]
+    evidence_end = max(target_times) if target_times else None
+    validation = [e for e in episodes[cut:]
+                  if e["timestamp"] - train[-1]["timestamp"] >= gap_s
+                  and (evidence_end is None or e["timestamp"] > evidence_end)]
     if not validation:
+        if evidence_end is not None:
+            raise ValueError("validation empty after trajectory target horizon/time gap; add later labels or more data")
         raise ValueError("validation empty after time gap; add labels or explicitly reduce --split-gap-s")
     return train, validation
 

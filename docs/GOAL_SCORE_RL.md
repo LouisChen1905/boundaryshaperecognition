@@ -2,6 +2,12 @@
 
 `goal_score_rl.py` 提供有读取预算的数据准备、单步强化学习环境、策略训练、评估和 JSON 模型导出。只使用 NumPy；数据准备复用 `replay_boundary.py`，因此还需要原项目的 Matplotlib。不会修改输入数据或 label 文件。
 
+除手工 `manual_desired_pose` 标签外，也支持 `navigation_topics.py` 默认导出的
+`motor_cut_trajectory_goal`。它将连续割刀运行轨迹上的未来位置作为示范目标，
+保留当前回放帧身份与目标来源，直接通过 `prepare --labels` 导入。
+导出参数与命令见 [NAVIGATION_TOPICS.md](NAVIGATION_TOPICS.md)。
+训练/验证按时间拆分时，会额外排除与训练样本未来目标时间重叠的验证帧。
+
 ## 问题定义
 
 - **状态**：按时间对齐、逐帧融合的历史地图，以及机器人当前位姿。训练使用每个安全候选点的几何特征表示该状态下的动作。

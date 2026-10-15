@@ -1,0 +1,21 @@
+{
+  "raw_records_read": 6000,
+  "raw_bytes_read": 330201733,
+  "labels": 1590,
+  "location_unknown_motor": 7,
+  "location_inactive_motor": 2195,
+  "skipped_auxiliary_timestamp": 2,
+  "skipped_location_timestamp": 0,
+  "topics": {
+    "location": 3792,
+    "visual_obstacle_front": 551,
+    "visual_boundary_points": 551,
+    "motor_cut": 762,
+    "cut_ctrl": 344
+  },
+  "source": "D:\\Downloads\\0047X\\navbag_boundary_202601015.jsonl",
+  "output": "C:\\Users\\175912\\Documents\\My Python Projects\\Boundary Shape Recognition\\rl_artifacts\\navbag_boundary_202601015_motor_labels_sample.jsonl",
+  "max_records": 6000,
+  "motor_max_age_s": 0.5,
+  "motor_timestamp_basis": "system_ms; causal relative to location.data.timestamp"
+}

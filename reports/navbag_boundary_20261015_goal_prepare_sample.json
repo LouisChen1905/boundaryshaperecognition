@@ -1,0 +1,79 @@
+{
+  "labels_loaded": 20,
+  "episodes": 12,
+  "skipped": [
+    {
+      "frame": 336,
+      "reason": "no baseline-positive safe candidates",
+      "status": "waiting_for_observation"
+    },
+    {
+      "frame": 342,
+      "reason": "no baseline-positive safe candidates",
+      "status": "waiting_for_observation"
+    },
+    {
+      "frame": 348,
+      "reason": "no baseline-positive safe candidates",
+      "status": "waiting_for_observation"
+    },
+    {
+      "frame": 354,
+      "reason": "no baseline-positive safe candidates",
+      "status": "waiting_for_observation"
+    },
+    {
+      "frame": 360,
+      "reason": "no baseline-positive safe candidates",
+      "status": "waiting_for_observation"
+    },
+    {
+      "frame": 365,
+      "reason": "no baseline-positive safe candidates",
+      "status": "incomplete_unreachable"
+    },
+    {
+      "frame": 370,
+      "reason": "no baseline-positive safe candidates",
+      "status": "incomplete_unreachable"
+    },
+    {
+      "frame": 377,
+      "reason": "no baseline-positive safe candidates",
+      "status": "incomplete_unreachable"
+    }
+  ],
+  "frames_read": 453,
+  "alignment": {
+    "location_packets": 3263,
+    "visual_packets": 457,
+    "aligned_frames": 453,
+    "exact_frames": 36,
+    "interpolated_frames": 417,
+    "skipped_invalid_timestamp": 4,
+    "skipped_invalid_pose": 0,
+    "skipped_backwards_visual": 0,
+    "skipped_pose_gap": 0,
+    "skipped_before_pose_history": 2,
+    "skipped_no_future_pose": 0,
+    "skipped_pending_overflow": 0,
+    "raw_records_read": 5129,
+    "raw_bytes_read": 276100437,
+    "motor_cut_packets": 656,
+    "cut_ctrl_packets": 296,
+    "obstacle_packets": 457,
+    "frames_with_obstacles": 453,
+    "motor_active_frames": 118
+  },
+  "budgets": {
+    "max_records": 6000,
+    "max_frames": 800,
+    "max_labels": 20,
+    "max_label_records": 20,
+    "max_candidates": 1024
+  },
+  "dataset": "rl_artifacts\\navbag_boundary_20261015_motor_goal_dataset_sample.json",
+  "label_type_counts": {
+    "motor_cut_trajectory_goal": 12
+  }
+}

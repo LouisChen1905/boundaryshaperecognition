@@ -11,6 +11,17 @@
 
 本文所有 Python 命令均应在项目根目录运行。已有的历史 CSV 文件现位于 `reports/`；生成新诊断数据时，请明确指定输出路径，例如 `--performance-log reports/exploration_new_profile.csv`。
 
+## 新增导航 topic 与割刀轨迹目标标签
+
+回放支持 `motor_cut`、`cut_ctrl` 和 `visual_obstacle_front`。同时间戳障碍物对象会传入探索器，供后续评分使用。`navigation_topics.py` 默认从割刀连续运行的轨迹中提取前方约 1 米的位姿，导出可直接由 `goal_score_rl.py prepare` 读取的目标标签：
+
+```powershell
+python navigation_topics.py "D:\Downloads\0047X\navbag_boundary_20261015.jsonl" --output rl_artifacts/motor_goal_labels.jsonl --max-records 6000 --max-labels 20
+python goal_score_rl.py prepare --source "D:\Downloads\0047X\navbag_boundary_20261015.jsonl" --labels rl_artifacts/motor_goal_labels.jsonl --output rl_artifacts/motor_dataset.json --max-records 6000 --max-frames 800 --max-labels 20 --max-label-records 20
+```
+
+`--lookahead-distance` 调整轨迹前视距离，`--label-format location` 保留原始位置导出。时间依据、配对规则、标签格式和抽样结果见 [NAVIGATION_TOPICS.md](docs/NAVIGATION_TOPICS.md)。标签可读入不等于存在可训练的安全候选，`prepare` 会报告跳过原因。
+
 ## 学习得到的探索目标评分
 
 `goal_score_rl.py` 实现了带数据量限制的 JSONL 数据准备、基于标注奖励的单步强化学习环境、NumPy 策略梯度训练、评估和评分模型导出。回放可通过 `--goal-score-model` 加载模型，现有安全约束仍然生效。命令、奖励设计、数据预算和评估限制详见 [GOAL_SCORE_RL.md](docs/GOAL_SCORE_RL.md)。

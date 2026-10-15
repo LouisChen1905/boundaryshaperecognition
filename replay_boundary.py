@@ -28,6 +28,7 @@ from boundary_shape import (grass_inside_support, grass_reference_coverage,
                             tracking_reference)
 from boundary_exploration import BoundaryExplorer, ExplorationConfig
 from goal_pose_labels import GoalPoseLabels, GoalPoseAnnotator
+from navigation_topics import AuxiliaryTopics, ObstacleObservation
 
 
 LOG_PATTERN = re.compile(
@@ -68,6 +69,14 @@ class Frame:
     pose_alignment: str = "embedded"
     pose_before_timestamp: Optional[float] = None
     pose_after_timestamp: Optional[float] = None
+    visual_obstacle_front: Optional[ObstacleObservation] = None
+    motor_cut: Optional[dict] = None
+    cut_ctrl: Optional[dict] = None
+
+    @property
+    def training_label(self):
+        """Unknown motor state stays unknown; commanded RPM is not measured RPM."""
+        return None if self.motor_cut is None else abs(self.motor_cut["rpm"]) > 0
 
 
 def rotation(roll: float, pitch: float, yaw: float) -> np.ndarray:
@@ -193,7 +202,8 @@ def _interpolate_attitude(first, second, fraction):
 
 
 def iter_data_package(path: Path, max_records: Optional[int] = None,
-                      pose_max_gap_s: float = 0.1, alignment_stats=None):
+                      pose_max_gap_s: float = 0.1, alignment_stats=None,
+                      motor_max_age_s: float = 0.5):
     """Align clouds to location.data.timestamp with bounded pose/pending buffers.
 
     Position is interpolated linearly and attitude by quaternion SLERP. Only
@@ -214,6 +224,9 @@ def iter_data_package(path: Path, max_records: Optional[int] = None,
     stats.update({name: 0 for name in names})
     stats["raw_records_read"] = 0
     stats["raw_bytes_read"] = 0
+    stats.update(motor_cut_packets=0, cut_ctrl_packets=0, obstacle_packets=0,
+                 frames_with_obstacles=0, motor_active_frames=0)
+    auxiliary = AuxiliaryTopics(max_age_s=motor_max_age_s)
     pose_times, poses = [], []
     pending = deque()
     previous_time = None
@@ -223,7 +236,7 @@ def iter_data_package(path: Path, max_records: Optional[int] = None,
         stats["skipped_" + reason] += 1
         if reason not in warned:
             warnings.warn("Skipping navigation packet: " + reason
-                          + " (alignment uses data.timestamp only)", RuntimeWarning)
+                          + " (cloud/pose alignment uses data.timestamp only)", RuntimeWarning)
             warned.add(reason)
 
     def ready_frames(final=False):
@@ -265,7 +278,12 @@ def iter_data_package(path: Path, max_records: Optional[int] = None,
                           boundary[:, (0, 2)], world,
                           camera_boundary_xyz=boundary, camera_grass_xyz=grass,
                           pose_alignment=method, pose_before_timestamp=before,
-                          pose_after_timestamp=after)
+                          pose_after_timestamp=after,
+                          visual_obstacle_front=auxiliary.obstacles.get(timestamp),
+                          motor_cut=auxiliary.state_at("motor_cut", timestamp),
+                          cut_ctrl=auxiliary.state_at("cut_ctrl", timestamp))
+            stats["frames_with_obstacles"] += int(frame.visual_obstacle_front is not None)
+            stats["motor_active_frames"] += int(frame.training_label is True)
             grass_world = (grass @ rotation(*CAMERA_RPY).T + CAMERA_TRANSLATION)
             frame.grass_world_xy = (grass_world @ robot_rotation.T + xyz)[:, :2]
             stats["aligned_frames"] += 1
@@ -280,6 +298,13 @@ def iter_data_package(path: Path, max_records: Optional[int] = None,
             try:
                 record = json.loads(line)
                 topic = record.get("topic")
+                if topic in ("motor_cut", "cut_ctrl", "visual_obstacle_front"):
+                    key = "obstacle_packets" if topic == "visual_obstacle_front" else topic + "_packets"
+                    stats[key] += 1
+                    if not auxiliary.ingest(record):
+                        skip("invalid_timestamp")
+                    yield from ready_frames()
+                    continue
                 if topic not in ("location", "visual_boundary_points"):
                     continue
                 data = record.get("data", {})
@@ -453,11 +478,13 @@ def update_exploration(explorer: BoundaryExplorer, frame: Frame,
         return explorer.update(frame.camera_grass_xyz, frame.camera_boundary_xyz,
                                pose, frame.timestamp,
                                sensor_to_world=camera_to_world_matrix(frame),
-                               performance=performance)
+                               performance=performance,
+                               visual_obstacle_front=frame.visual_obstacle_front)
     grass = frame.grass_world_xy
     return explorer.update(grass if grass is not None else np.empty((0, 2)),
                            frame.world_points[:, :2], pose, frame.timestamp,
-                           performance=performance)
+                           performance=performance,
+                           visual_obstacle_front=frame.visual_obstacle_front)
 
 
 def _cell_polygons(cells, resolution):

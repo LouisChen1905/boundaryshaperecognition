@@ -160,6 +160,8 @@ class BoundaryExplorer:
         self._goal_progress_distance = None
         self._goal_refresh_time = None
         self._goal_refresh_pose = None
+        self.visual_obstacle_front = None
+        self.obstacle_world_xy = np.empty((0, 2))
 
     def cell(self, xy):
         x, y = np.asarray(xy, dtype=float)[:2]
@@ -863,7 +865,8 @@ class BoundaryExplorer:
         return status, reason, goal, path
 
     def update(self, grass_points, boundary_points, robot_pose, timestamp,
-               sensor_to_world=None, position_std=0.0, performance=None):
+               sensor_to_world=None, position_std=0.0, performance=None,
+               visual_obstacle_front=None):
         """Fuse one observation and return the next safe exploration decision.
 
         ``robot_pose`` is global (x, y, yaw). Point arrays are either global
@@ -872,6 +875,9 @@ class BoundaryExplorer:
         timestamps re-evaluate the pose but do not fuse evidence again;
         backwards timestamps are rejected. Classification changes reset visit
         penalties, and stalled means reachable views have been exhausted.
+        visual_obstacle_front is an optional same-timestamp camera observation;
+        it is retained with object metadata for future scoring, without fusing
+        obstacle points into grass or boundary evidence.
         """
         started = perf_counter_ns()
         stage = started
@@ -890,6 +896,13 @@ class BoundaryExplorer:
             raise ValueError("timestamp must advance and position_std must be nonnegative")
         grass = points_to_world_xy(grass_points, sensor_to_world)
         observed_boundary = points_to_world_xy(boundary_points, sensor_to_world)
+        obstacle_world = np.empty((0, 2))
+        if visual_obstacle_front is not None:
+            if abs(visual_obstacle_front.timestamp - timestamp) > 1e-6:
+                raise ValueError("obstacles must match the observation timestamp")
+            obstacle_world = points_to_world_xy(visual_obstacle_front.camera_xyz, sensor_to_world)
+        self.visual_obstacle_front = visual_obstacle_front
+        self.obstacle_world_xy = obstacle_world
         if performance is not None:
             performance["transform_ms"] = (perf_counter_ns() - stage) / 1e6
             performance["grass_points"] = len(grass)

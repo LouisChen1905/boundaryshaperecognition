@@ -1,0 +1,43 @@
+{
+  "alignment_stats": {
+    "location_packets": 490,
+    "visual_packets": 84,
+    "aligned_frames": 81,
+    "exact_frames": 15,
+    "interpolated_frames": 66,
+    "skipped_invalid_timestamp": 2,
+    "skipped_invalid_pose": 0,
+    "skipped_backwards_visual": 0,
+    "skipped_pose_gap": 0,
+    "skipped_before_pose_history": 2,
+    "skipped_no_future_pose": 0,
+    "skipped_pending_overflow": 0,
+    "raw_records_read": 800,
+    "raw_bytes_read": 52097249,
+    "motor_cut_packets": 98,
+    "cut_ctrl_packets": 44,
+    "obstacle_packets": 84,
+    "frames_with_obstacles": 81,
+    "motor_active_frames": 0
+  },
+  "samples": [
+    {
+      "timestamp": 1792034655.496,
+      "objects": 3,
+      "points": 67,
+      "flag": null
+    },
+    {
+      "timestamp": 1792034655.646,
+      "objects": 3,
+      "points": 60,
+      "flag": false
+    },
+    {
+      "timestamp": 1792034655.746,
+      "objects": 4,
+      "points": 64,
+      "flag": false
+    }
+  ]
+}

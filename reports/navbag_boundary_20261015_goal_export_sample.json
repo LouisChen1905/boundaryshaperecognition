@@ -1,0 +1,46 @@
+{
+  "labels": 20,
+  "frames_read": 488,
+  "inactive_or_unknown_frames": 335,
+  "skipped_discontinuity": 0,
+  "skipped_horizon": 0,
+  "skipped_pending_overflow": 0,
+  "skipped_no_future_target": 0,
+  "source": "D:\\Downloads\\0047X\\navbag_boundary_20261015.jsonl",
+  "output": "C:\\Users\\175912\\Documents\\My Python Projects\\Boundary Shape Recognition\\rl_artifacts\\navbag_boundary_20261015_motor_goal_labels_sample.jsonl",
+  "label_type": "motor_cut_trajectory_goal",
+  "alignment": {
+    "location_packets": 3497,
+    "visual_packets": 492,
+    "aligned_frames": 488,
+    "exact_frames": 36,
+    "interpolated_frames": 452,
+    "skipped_invalid_timestamp": 4,
+    "skipped_invalid_pose": 0,
+    "skipped_backwards_visual": 0,
+    "skipped_pose_gap": 0,
+    "skipped_before_pose_history": 2,
+    "skipped_no_future_pose": 0,
+    "skipped_pending_overflow": 0,
+    "raw_records_read": 5502,
+    "raw_bytes_read": 296727021,
+    "motor_cut_packets": 703,
+    "cut_ctrl_packets": 318,
+    "obstacle_packets": 492,
+    "frames_with_obstacles": 488,
+    "motor_active_frames": 153
+  },
+  "budgets": {
+    "max_records": 6000,
+    "max_frames": 800,
+    "max_labels": 20
+  },
+  "export_options": {
+    "lookahead_distance": 1.0,
+    "max_horizon_s": 10.0,
+    "label_interval_s": 1.0,
+    "max_frame_gap_s": 0.5,
+    "motor_max_age_s": 0.5,
+    "pose_max_gap_s": 0.1
+  }
+}

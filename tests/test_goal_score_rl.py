@@ -228,6 +228,18 @@ class GoalScoreRLTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source mismatch"):
                 load_labels(path, root/"different.jsonl", max_label_records=1)
 
+    def test_trajectory_split_excludes_future_training_target_overlap(self):
+        samples = [episode(i, float(i)) for i in range(1, 7)]
+        samples[0].update(label_type="motor_cut_trajectory_goal",
+                          label_provenance=dict(target_timestamp=4.))
+        samples[1].update(label_type="motor_cut_trajectory_goal",
+                          label_provenance=dict(target_timestamp=5.))
+        training, validation = split_episodes(samples, train_fraction=.34, gap_s=0.)
+        self.assertEqual([e["frame"] for e in training], [1, 2])
+        self.assertEqual([e["frame"] for e in validation], [6])
+        with self.assertRaisesRegex(ValueError, "trajectory target horizon"):
+            split_episodes(samples[:5], train_fraction=.4, gap_s=0.)
+
 
 if __name__ == "__main__":
     unittest.main()
